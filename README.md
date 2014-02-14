@@ -7,5 +7,5 @@ A copy-on-access module for device mapper, which has the following features:
 
 2. Copy-on-Read(CoR), which copies data when a block it is read.
 
-3. Separate meta-data storage, which allows the cache storage to be used as 
+3. The same layout (almost) as origin, which allows the replica to be used as 
    a standalone copy, if the full content has been copied.
