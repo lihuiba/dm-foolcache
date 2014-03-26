@@ -9,9 +9,12 @@ be used in conjunction with a background replicator.
 
 Foolcache implements the following actions:
 
-1. Copy-on-Write(CoW), which copies data when a block is partially written.
+1. Copy-on-Read(CoR), which copies data when a block it is read.
 
-2. Copy-on-Read(CoR), which copies data when a block it is read.
+2. Copy-on-Write(CoW), which copies data when a block is partially written.
 
-Foolcache judges whether a block is cached or not by looking-up a bit array,
+3. Full-sized cache media, which drops the need for cache invalidation. 
+"Full" and "fool" are homophonic.
+
+Foolcache judges whether a block is cached or not by looking-up a bitmap,
 and foolcache stores meta-data at the tail of the cache media. 
