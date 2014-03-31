@@ -481,6 +481,13 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad4;
 	}
 
+	fcc->io_client = dm_io_client_create();
+	if (IS_ERR(fcc->io_client)) 
+	{
+		ti->error = "dm-foolcache: dm_io_client_create() error";
+		goto bad4;
+	}
+
 	memset(fcc->copying, 0 ,bitmap_size);
 	if (argc>=4 && strcmp(argv[3], "create")==0)
 	{	// create new cache
@@ -489,7 +496,7 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		if (r!=0)
 		{
 			ti->error = "dm-foolcache: ender write error";
-			goto bad4;
+			goto bad5;
 		}
 	}
 	else
@@ -498,15 +505,8 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		if (r!=0)
 		{
 			ti->error = "dm-foolcache: ender read error";
-			goto bad4;
+			goto bad5;
 		}
-	}
-
-	fcc->io_client = dm_io_client_create();
-	if (IS_ERR(fcc->io_client)) 
-	{
-		ti->error = "dm-foolcache: dm_io_client_create() error";
-		goto bad4;
 	}
 
 	init_completion(&fcc->copied);
@@ -516,6 +516,8 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	ti->private = fcc;
 	return 0;
 
+bad5:
+	dm_io_client_destroy(fcc->io_client);
 bad4:
 	if (fcc->bitmap) kfree(fcc->bitmap);
 	if (fcc->copying) kfree(fcc->copying);
@@ -533,6 +535,7 @@ static void foolcache_dtr(struct dm_target *ti)
 	struct foolcache_c *fcc = ti->private;
 	kfree(fcc->bitmap);
 	kfree(fcc->copying);
+	dm_io_client_destroy(fcc->io_client);
 	dm_put_device(ti, fcc->cache);
 	dm_put_device(ti, fcc->origin);
 	kfree(fcc);
