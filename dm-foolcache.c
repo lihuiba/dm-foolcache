@@ -359,13 +359,13 @@ retry:
 	// do reading
 	buf=vmalloc(fcc->block_size);
 	region.bdev = fcc->origin->bdev;
-	region.sector = (block << fcc->block_shift);
+	region.sector = block2sector(fcc, block);
 	region.count = fcc->block_size;
 	io_req.bi_rw = READ;
 	io_req.mem.type = DM_IO_VMA;
 	io_req.mem.ptr.vma = buf;
-	// io_req.notify.fn = ,
-	// io_req.notify.context = ,
+	io_req.notify.fn = NULL;
+	io_req.notify.context = NULL;
 	io_req.client = fcc->io_client;
 	printk("dm-foolcache: asdf2\n");
 	r=dm_io(&io_req, 1, &region, NULL);
@@ -477,10 +477,13 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		ti->error = "dm-foolcache: Invalid block size";
 		goto bad3;
 	}
+	printk("dm-foolcache: bs %uKB\n", bs);
+
 	bs*=(1024/512); // KB to sector
 	fcc->block_size = bs;
-	fcc->block_shift = ffs(bs);
+	fcc->block_shift = ffs(bs)-1;
 	fcc->block_mask = ~(bs-1);
+	printk("dm-foolcache: bshift %u, bmask %u\n", fcc->block_shift, fcc->block_mask);
 
 	fcc->bitmap_sectors = fcc->sectors/bs/8/512 + 1; 	// sizeof bitmap, in sector
 	fcc->last_caching_sector = fcc->sectors - 1 - 1 - fcc->bitmap_sectors;
