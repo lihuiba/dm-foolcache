@@ -21,6 +21,11 @@ merge the bitmaps
 
  */
 
+const static char SIGNATURE[]="FOOLCACHE";
+struct header {
+	char signature[sizeof(SIGNATURE)];
+	unsigned int block_size;
+};
 
 struct foolcache_c {
 	struct dm_dev* cache;
@@ -33,6 +38,7 @@ struct foolcache_c {
 	unsigned int block_mask;
 	unsigned long* bitmap;
 	unsigned long* copying;
+	struct header* header;
 	unsigned int bitmap_sectors;
 	struct completion copied;
 //	struct dm_kcopyd_client* kcopyd_client;
@@ -49,11 +55,6 @@ struct job_kcopyd {
 	struct dm_io_region origin, cache;
 };
 */
-const static char SIGNATURE[]="FOOLCACHE";
-struct header {
-	char signature[sizeof(SIGNATURE)];
-	unsigned int block_size;
-};
 
 static inline unsigned long sector2block(struct foolcache_c* fcc, sector_t sector)
 {
@@ -68,8 +69,6 @@ static inline sector_t block2sector(struct foolcache_c* fcc, unsigned long block
 static int write_ender(struct foolcache_c* fcc)
 {
 	int r;
-	char buf[512];
-	struct header* header = (struct header*)buf;
 	struct dm_io_region region = {
 		.bdev = fcc->cache->bdev,
 		.sector = fcc->sectors - (fcc->bitmap_sectors + 1),
@@ -77,8 +76,8 @@ static int write_ender(struct foolcache_c* fcc)
 	};
 	struct dm_io_request io_req = {
 		.bi_rw = WRITE,
-		.mem.type = DM_IO_VMA,
-		.mem.ptr.vma = fcc->bitmap,
+		.mem.type = DM_IO_KMEM,
+		.mem.ptr.addr = fcc->bitmap,
 		// .notify.fn = ,
 		// .notify.context = ,
 		.client = fcc->io_client,
@@ -86,11 +85,11 @@ static int write_ender(struct foolcache_c* fcc)
 	r=dm_io(&io_req, 1, &region, NULL);
 	if (r!=0) return r;
 
-	memcpy(header->signature, SIGNATURE, sizeof(SIGNATURE));
-	header->block_size = fcc->block_size;
+	memcpy(fcc->header->signature, SIGNATURE, sizeof(SIGNATURE));
+	fcc->header->block_size = fcc->block_size;
 	region.sector = fcc->sectors - 1;
 	region.count = 1;
-	io_req.mem.ptr.vma = buf;
+	io_req.mem.ptr.addr = fcc->header;
 	r = dm_io(&io_req, 1, &region, NULL);
 	return r;
 }
@@ -98,8 +97,6 @@ static int write_ender(struct foolcache_c* fcc)
 static int read_ender(struct foolcache_c* fcc)
 {
 	int r;
-	char buf[512];
-	struct header* header = (struct header*)buf;
 	struct dm_io_region region = {
 		.bdev = fcc->cache->bdev,
 		.sector = fcc->sectors - 1,
@@ -107,8 +104,8 @@ static int read_ender(struct foolcache_c* fcc)
 	};
 	struct dm_io_request io_req = {
 		.bi_rw = READ,
-		.mem.type = DM_IO_VMA,
-		.mem.ptr.vma = buf,
+		.mem.type = DM_IO_KMEM,
+		.mem.ptr.addr = fcc->header,
 		// .notify.fn = ,
 		// .notify.context = ,
 		.client = fcc->io_client,
@@ -116,11 +113,11 @@ static int read_ender(struct foolcache_c* fcc)
 	r=dm_io(&io_req, 1, &region, NULL);
 	if (r!=0) return r;
 
-	r=strncmp(header->signature, SIGNATURE, sizeof(SIGNATURE)-1);
+	r=strncmp(fcc->header->signature, SIGNATURE, sizeof(SIGNATURE)-1);
 	if (r!=0) return r;
-	if (header->block_size != fcc->block_size) return -EINVAL;
+	if (fcc->header->block_size != fcc->block_size) return -EINVAL;
 
-	io_req.mem.ptr.vma = fcc->bitmap;
+	io_req.mem.ptr.addr = fcc->bitmap;
 	region.sector = fcc->last_caching_sector + 1;
 	region.count = fcc->bitmap_sectors;
 	r = dm_io(&io_req, 1, &region, NULL);
@@ -473,9 +470,10 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	fcc->bitmap_sectors = fcc->sectors/bs/8/512 + 1; 	// sizeof bitmap, in sector
 	fcc->last_caching_sector = fcc->sectors - 1 - 1 - fcc->bitmap_sectors;
 	bitmap_size = fcc->bitmap_sectors*512;
-	fcc->bitmap = kmalloc(bitmap_size, GFP_KERNEL);
-	fcc->copying = kmalloc(bitmap_size, GFP_KERNEL);
-	if (fcc->bitmap==NULL || fcc->copying==NULL)
+	fcc->bitmap = kzalloc(bitmap_size, GFP_KERNEL);
+	fcc->copying = kzalloc(bitmap_size, GFP_KERNEL);
+	fcc->header = kzalloc(512, GFP_KERNEL);
+	if (fcc->bitmap==NULL || fcc->copying==NULL || fcc->header==NULL)
 	{
 		ti->error = "dm-foolcache: Cannot allocate bitmaps";
 		goto bad4;
@@ -521,6 +519,7 @@ bad5:
 bad4:
 	if (fcc->bitmap) kfree(fcc->bitmap);
 	if (fcc->copying) kfree(fcc->copying);
+	if (fcc->header) kfree(fcc->header);
 bad3:
 	dm_put_device(ti, fcc->cache);
 bad2:
@@ -535,6 +534,7 @@ static void foolcache_dtr(struct dm_target *ti)
 	struct foolcache_c *fcc = ti->private;
 	kfree(fcc->bitmap);
 	kfree(fcc->copying);
+	kfree(fcc->header);
 	dm_io_client_destroy(fcc->io_client);
 	dm_put_device(ti, fcc->cache);
 	dm_put_device(ti, fcc->origin);
