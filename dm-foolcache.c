@@ -76,8 +76,8 @@ static int write_ender(struct foolcache_c* fcc)
 	};
 	struct dm_io_request io_req = {
 		.bi_rw = WRITE,
-		.mem.type = DM_IO_KMEM,
-		.mem.ptr.addr = fcc->bitmap,
+		.mem.type = DM_IO_VMA,
+		.mem.ptr.vma = fcc->bitmap,
 		// .notify.fn = ,
 		// .notify.context = ,
 		.client = fcc->io_client,
@@ -90,7 +90,7 @@ static int write_ender(struct foolcache_c* fcc)
 	region.sector = fcc->sectors - 1;
 	region.count = 1;
 	io_req.mem.ptr.addr = fcc->header;
-	r = dm_io(&io_req, 1, &region, NULL);
+//	r = dm_io(&io_req, 1, &region, NULL);
 	return r;
 }
 
@@ -104,8 +104,8 @@ static int read_ender(struct foolcache_c* fcc)
 	};
 	struct dm_io_request io_req = {
 		.bi_rw = READ,
-		.mem.type = DM_IO_KMEM,
-		.mem.ptr.addr = fcc->header,
+		.mem.type = DM_IO_VMA,
+		.mem.ptr.vma = fcc->header,
 		// .notify.fn = ,
 		// .notify.context = ,
 		.client = fcc->io_client,
@@ -435,7 +435,7 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		return -EINVAL;
 	}
 
-	fcc = kzalloc(sizeof(*fcc), GFP_KERNEL);
+	fcc = vzalloc(sizeof(*fcc), GFP_KERNEL);
 	if (fcc == NULL) {
 		ti->error = "dm-foolcache: Cannot allocate foolcache context";
 		return -ENOMEM;
@@ -470,9 +470,9 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	fcc->bitmap_sectors = fcc->sectors/bs/8/512 + 1; 	// sizeof bitmap, in sector
 	fcc->last_caching_sector = fcc->sectors - 1 - 1 - fcc->bitmap_sectors;
 	bitmap_size = fcc->bitmap_sectors*512;
-	fcc->bitmap = kzalloc(bitmap_size, GFP_KERNEL);
-	fcc->copying = kzalloc(bitmap_size, GFP_KERNEL);
-	fcc->header = kzalloc(512, GFP_KERNEL);
+	fcc->bitmap = vzalloc(bitmap_size, GFP_KERNEL);
+	fcc->copying = vzalloc(bitmap_size, GFP_KERNEL);
+	fcc->header = vzalloc(512, GFP_KERNEL);
 	if (fcc->bitmap==NULL || fcc->copying==NULL || fcc->header==NULL)
 	{
 		ti->error = "dm-foolcache: Cannot allocate bitmaps";
@@ -517,28 +517,28 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 bad5:
 	dm_io_client_destroy(fcc->io_client);
 bad4:
-	if (fcc->bitmap) kfree(fcc->bitmap);
-	if (fcc->copying) kfree(fcc->copying);
-	if (fcc->header) kfree(fcc->header);
+	if (fcc->bitmap) vfree(fcc->bitmap);
+	if (fcc->copying) vfree(fcc->copying);
+	if (fcc->header) vfree(fcc->header);
 bad3:
 	dm_put_device(ti, fcc->cache);
 bad2:
 	dm_put_device(ti, fcc->origin);
 bad1:
-	kfree(fcc);
+	vfree(fcc);
 	return -EINVAL;
 }
 
 static void foolcache_dtr(struct dm_target *ti)
 {
 	struct foolcache_c *fcc = ti->private;
-	kfree(fcc->bitmap);
-	kfree(fcc->copying);
-	kfree(fcc->header);
+	vfree(fcc->bitmap);
+	vfree(fcc->copying);
+	vfree(fcc->header);
 	dm_io_client_destroy(fcc->io_client);
 	dm_put_device(ti, fcc->cache);
 	dm_put_device(ti, fcc->origin);
-	kfree(fcc);
+	vfree(fcc);
 }
 
 static int foolcache_status(struct dm_target *ti, status_type_t type,
