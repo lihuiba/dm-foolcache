@@ -333,10 +333,11 @@ static void fc_map(struct foolcache_c* fcc, struct bio* bio)
 static int copy_block(struct foolcache_c* fcc, unsigned int block)
 {
 	int r = 0;
+	char* buf;
 	struct dm_io_region region;
 	struct dm_io_request io_req;
-	char* buf;
 
+	printk("dm-foolcache: asdf1");
 	// before copying
 	if (fcc->bypassing || test_bit(block, fcc->bitmap)) return 0;
 	if (test_and_set_bit(block, fcc->copying))
@@ -356,21 +357,29 @@ retry:
 	if (test_bit(block, fcc->bitmap)) goto out;
 
 	// do reading
-	region.bdev = fcc->origin->bdev,
-	region.sector = (block << fcc->block_shift),
-	region.count = fcc->block_size,
-	io_req.bi_rw = READ,
-	io_req.mem.type = DM_IO_VMA,
-	io_req.mem.ptr.vma = vmalloc(fcc->block_size),
+	buf=vmalloc(fcc->block_size);
+	region.bdev = fcc->origin->bdev;
+	region.sector = (block << fcc->block_shift);
+	region.count = fcc->block_size;
+	io_req.bi_rw = READ;
+	io_req.mem.type = DM_IO_VMA;
+	io_req.mem.ptr.vma = buf;
 	// io_req.notify.fn = ,
 	// io_req.notify.context = ,
-	io_req.client = fcc->io_client,
+	io_req.client = fcc->io_client;
+	printk("dm-foolcache: asdf2");
 	r=dm_io(&io_req, 1, &region, NULL);
 	if (r!=0) goto out2;
 
 	// do writing
 	io_req.bi_rw = WRITE;
 	region.bdev = fcc->cache->bdev;
+	if (io_req.mem.ptr.vma!=buf)
+	{
+		printk("dm-foolcache: vma!=buf");
+		io_req.mem.ptr.vma=buf;
+	}
+	printk("dm-foolcache: asdf3");
 	r=dm_io(&io_req, 1, &region, NULL);
 	if (r!=0)
 	{
@@ -381,6 +390,7 @@ retry:
 	set_bit(block, fcc->bitmap);
 
 out2:
+	printk("dm-foolcache: asdf4");
 	vfree(io_req.mem.ptr.vma);
 out:// after copying
 	clear_bit(block, fcc->copying);
@@ -398,7 +408,7 @@ static int foolcache_map_sync(struct foolcache_c* fcc, struct bio* bio)
 	}
 
 	last_sector = bio->bi_sector + bio->bi_size/512 - 1;
-	if (fcc->bypassing || last_sector > fcc->last_caching_sector)
+	if (unlikely(fcc->bypassing || last_sector > fcc->last_caching_sector))
 	{
 		bio->bi_bdev = fcc->origin->bdev;
 	}
