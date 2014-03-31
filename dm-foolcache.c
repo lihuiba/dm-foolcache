@@ -330,7 +330,30 @@ static void fc_map(struct foolcache_c* fcc, struct bio* bio)
 	return DM_MAPIO_REMAPPED;
 }
 */
-static int copy_block(struct foolcache_c* fcc, unsigned int block)
+
+static int read_origin(struct foolcache_c* fcc, unsigned long block, void* buf)
+{
+	int r;
+	struct dm_io_region region = {
+		.bdev = fcc->origin->bdev,
+		.sector = block2sector(fcc, block),
+		.count = fcc->block_size,
+	};
+	struct dm_io_request io_req = {
+		.bi_rw = READ,
+		.mem.type = DM_IO_VMA,
+		.mem.ptr.vma = buf,
+		// .notify.fn = ,
+		// .notify.context = ,
+		.client = fcc->io_client,
+	};
+	printk("dm-foolcache: asdf2 block=%llu, bs=%u\n", block, fcc->block_size);
+	r=dm_io(&io_req, 1, &region, NULL);
+	printk("dm-foolcache: -asdf2\n");
+	return r;
+}
+
+static int copy_block(struct foolcache_c* fcc, unsigned long block)
 {
 	int r = 0;
 	char* buf;
@@ -357,19 +380,8 @@ retry:
 	if (test_bit(block, fcc->bitmap)) goto out;
 
 	// do reading
-	buf=vmalloc(fcc->block_size);
-	region.bdev = fcc->origin->bdev;
-	region.sector = block2sector(fcc, block);
-	region.count = fcc->block_size;
-	io_req.bi_rw = READ;
-	io_req.mem.type = DM_IO_VMA;
-	io_req.mem.ptr.vma = buf;
-	io_req.mem.offset = 0;
-	io_req.notify.fn = NULL;
-	io_req.notify.context = NULL;
-	io_req.client = fcc->io_client;
-	printk("dm-foolcache: asdf2\n");
-	r=dm_io(&io_req, 1, &region, NULL);
+	buf=vmalloc(fcc->block_size*512);
+	r=read_origin(fcc, block, buf);
 	if (r!=0) goto out2;
 	goto out2;
 
