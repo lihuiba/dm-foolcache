@@ -364,6 +364,7 @@ retry:
 	io_req.bi_rw = READ;
 	io_req.mem.type = DM_IO_VMA;
 	io_req.mem.ptr.vma = buf;
+	io_req.mem.offset = 0;
 	io_req.notify.fn = NULL;
 	io_req.notify.context = NULL;
 	io_req.client = fcc->io_client;
