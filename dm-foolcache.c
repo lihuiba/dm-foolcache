@@ -34,12 +34,12 @@ struct foolcache_c {
 	unsigned long* bitmap;
 	unsigned long* copying;
 	unsigned int bitmap_sectors;
-	struct dm_kcopyd_client* kcopyd_client;
-	struct job_kcopyd* queue;
 	struct completion copied;
-	spinlock_t qlock;
+//	struct dm_kcopyd_client* kcopyd_client;
+//	struct job_kcopyd* queue;
+//	spinlock_t qlock;
 };
-
+/*
 struct job_kcopyd {
 	struct job_kcopyd* next;
 	struct bio* bio;
@@ -47,6 +47,12 @@ struct job_kcopyd {
 	unsigned int bi_size;
 	unsigned long current_block, end_blocks;
 	struct dm_io_region origin, cache;
+};
+*/
+const static char SIGNATURE[]="FOOLCACHE";
+struct header {
+	char signature[sizeof(SIGNATURE)];
+	unsigned int block_size;
 };
 
 static inline unsigned long sector2block(struct foolcache_c* fcc, sector_t sector)
@@ -59,8 +65,11 @@ static inline sector_t block2sector(struct foolcache_c* fcc, unsigned long block
 	return block << fcc->block_shift;
 }
 
-static int write_bitmap(struct foolcache_c* fcc)
+static int write_ender(struct foolcache_c* fcc)
 {
+	int r;
+	char buf[512];
+	struct header* header = (struct header*)buf;
 	struct dm_io_region region = {
 		.bdev = fcc->cache->bdev,
 		.sector = fcc->sectors - (fcc->bitmap_sectors + 1),
@@ -74,13 +83,23 @@ static int write_bitmap(struct foolcache_c* fcc)
 		// .notify.context = ,
 		.client = fcc->io_client,
 	};
-	return dm_io(&io_req, 1, &region, NULL);
+	r=dm_io(&io_req, 1, &region, NULL);
+	if (r!=0) return r;
+
+	memcpy(header->signature, SIGNATURE, sizeof(SIGNATURE));
+	header->block_size = fcc->block_size;
+	region.sector = fcc->sectors - 1;
+	region.count = 1;
+	io_req.mem.ptr.vma = buf;
+	r = dm_io(&io_req, 1, &region, NULL);
+	return r;
 }
 
-static int read_bitmap(struct foolcache_c* fcc)
+static int read_ender(struct foolcache_c* fcc)
 {
+	int r;
 	char buf[512];
-	const static char SIGNATURE[]="FOOLCACHE";
+	struct header* header = (struct header*)buf;
 	struct dm_io_region region = {
 		.bdev = fcc->cache->bdev,
 		.sector = fcc->sectors - 1,
@@ -94,24 +113,18 @@ static int read_bitmap(struct foolcache_c* fcc)
 		// .notify.context = ,
 		.client = fcc->io_client,
 	};
-	int r=dm_io(&io_req, 1, &region, NULL);
+	r=dm_io(&io_req, 1, &region, NULL);
 	if (r!=0) return r;
 
-	r=strncmp(buf, SIGNATURE, sizeof(SIGNATURE)-1);
+	r=strncmp(header->signature, SIGNATURE, sizeof(SIGNATURE)-1);
 	if (r!=0) return r;
+	if (header->block_size != fcc->block_size) return -EINVAL;
 
-	io_req.mem.ptr.vma = vmalloc(fcc->bitmap_sectors*512);
-	region.sector = fcc->sectors - (fcc->bitmap_sectors + 1);
+	io_req.mem.ptr.vma = fcc->bitmap;
+	region.sector = fcc->last_caching_sector + 1;
 	region.count = fcc->bitmap_sectors;
 	r = dm_io(&io_req, 1, &region, NULL);
-	if (r!=0)
-	{
-		vfree(io_req.mem.ptr.vma);
-		return r;
-	}
-
-	fcc->bitmap=io_req.mem.ptr.vma;
-	return 0;
+	return r;
 }
 
 /*
@@ -406,6 +419,10 @@ static int foolcache_map_sync(struct foolcache_c* fcc, struct bio* bio)
 	return DM_MAPIO_REMAPPED;
 }
 
+static inline bool isorder2(unsigned int x)
+{
+	return (x & (x-1)) == 0;
+}
 
 /*
  * Construct a foolcache mapping
@@ -414,14 +431,14 @@ static int foolcache_map_sync(struct foolcache_c* fcc, struct bio* bio)
 static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	struct foolcache_c *fcc;
-	unsigned int bs;
+	unsigned int bs, bitmap_size, r;
 
 	if (argc<2) {
 		ti->error = "Invalid argument count";
 		return -EINVAL;
 	}
 
-	fcc = kmalloc(sizeof(*fcc), GFP_KERNEL);
+	fcc = kzalloc(sizeof(*fcc), GFP_KERNEL);
 	if (fcc == NULL) {
 		ti->error = "dm-foolcache: Cannot allocate foolcache context";
 		return -ENOMEM;
@@ -437,30 +454,75 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad2;
 	}
 
-	if (sscanf(argv[2], "%u", &bs)!=1 || bs<4 || bs>1024*1024) {
+	fcc->sectors = (i_size_read(fcc->origin->bdev->bd_inode) >> SECTOR_SHIFT);
+	if (fcc->sectors != (i_size_read(fcc->cache->bdev->bd_inode) >> SECTOR_SHIFT))
+	{
+		ti->error = "dm-foolcache: Device sub-device size mismatch";
+		goto bad3;
+	}
+
+	if (sscanf(argv[2], "%u", &bs)!=1 || bs<4 || bs>1024*1024 || !isorder2(bs)) {
 		ti->error = "dm-foolcache: Invalid block size";
 		goto bad3;
 	}
-	bs/=2; // KB to sector
+	bs*=(1024/512); // KB to sector
 	fcc->block_size = bs;
-	fcc->block_shift = find_first_bit(&bs, sizeof(bs)*8);
+	fcc->block_shift = ffs(bs);
 	fcc->block_mask = ~(bs-1);
 
-	
-	if (argc>=3 && strcmp(argv[3], "create")
+	fcc->bitmap_sectors = fcc->sectors/bs/8/512 + 1; 	// sizeof bitmap, in sector
+	fcc->last_caching_sector = fcc->sectors - 1 - 1 - fcc->bitmap_sectors;
+	bitmap_size = fcc->bitmap_sectors*512;
+	fcc->bitmap = kmalloc(bitmap_size, GFP_KERNEL);
+	fcc->copying = kmalloc(bitmap_size, GFP_KERNEL);
+	if (fcc->bitmap==NULL || fcc->copying==NULL)
 	{
-		// todo
+		ti->error = "dm-foolcache: Cannot allocate bitmaps";
+		goto bad4;
 	}
+
+	memset(fcc->copying, 0 ,bitmap_size);
+	if (argc>=4 && strcmp(argv[3], "create")==0)
+	{	// create new cache
+		memset(fcc->bitmap, 0, bitmap_size);
+		r=write_ender(fcc);
+		if (r!=0)
+		{
+			ti->error = "dm-foolcache: ender write error";
+			goto bad4;
+		}
+	}
+	else
+	{	// open existing cache
+		r=read_ender(fcc);
+		if (r!=0)
+		{
+			ti->error = "dm-foolcache: ender read error";
+			goto bad4;
+		}
+	}
+
+	fcc->io_client = dm_io_client_create();
+	if (IS_ERR(fcc->io_client)) 
+	{
+		ti->error = "dm-foolcache: dm_io_client_create() error";
+		goto bad4;
+	}
+
+	init_completion(&fcc->copied);
 
 	ti->num_flush_requests = 1;
 	ti->num_discard_requests = 1;
 	ti->private = fcc;
 	return 0;
 
+bad4:
+	if (fcc->bitmap) kfree(fcc->bitmap);
+	if (fcc->copying) kfree(fcc->copying);
 bad3:
-	dm_put_device(ti, &fcc->cache);
+	dm_put_device(ti, fcc->cache);
 bad2:
-	dm_put_device(ti, &fcc->origin);
+	dm_put_device(ti, fcc->origin);
 bad1:
 	kfree(fcc);
 	return -EINVAL;
@@ -469,33 +531,11 @@ bad1:
 static void foolcache_dtr(struct dm_target *ti)
 {
 	struct foolcache_c *fcc = ti->private;
-
-	dm_put_device(ti, fcc->dev);
+	kfree(fcc->bitmap);
+	kfree(fcc->copying);
+	dm_put_device(ti, fcc->cache);
+	dm_put_device(ti, fcc->origin);
 	kfree(fcc);
-}
-
-static sector_t linear_map_sector(struct dm_target *ti, sector_t bi_sector)
-{
-	struct foolcache_c *fcc = ti->private;
-
-	return fcc->start + dm_target_offset(ti, bi_sector);
-}
-
-static void linear_map_bio(struct dm_target *ti, struct bio *bio)
-{
-	struct foolcache_c *fcc = ti->private;
-
-	bio->bi_bdev = fcc->dev->bdev;
-	if (bio_sectors(bio))
-		bio->bi_sector = linear_map_sector(ti, bio->bi_sector);
-}
-
-static int foolcache_map(struct dm_target *ti, struct bio *bio,
-		      union map_info *map_context)
-{
-	linear_map_bio(ti, bio);
-
-	return DM_MAPIO_REMAPPED;
 }
 
 static int foolcache_status(struct dm_target *ti, status_type_t type,
@@ -509,8 +549,8 @@ static int foolcache_status(struct dm_target *ti, status_type_t type,
 		break;
 
 	case STATUSTYPE_TABLE:
-		snprintf(result, maxlen, "%s %llu", fcc->dev->name,
-				(unsigned long long)fcc->start);
+		snprintf(result, maxlen, "%s %s %u", fcc->origin->name, 
+			fcc->cache->name, fcc->block_size*(1024/512));
 		break;
 	}
 	return 0;
@@ -520,24 +560,16 @@ static int foolcache_ioctl(struct dm_target *ti, unsigned int cmd,
 			unsigned long arg)
 {
 	struct foolcache_c *fcc = ti->private;
-	struct dm_dev *dev = fcc->dev;
 	int r = 0;
 
-	if (cmd==FIEMAP)
-	{
+	// if (cmd==FIEMAP)
+	// {
 
-	}
+	// }
 
-	/*
-	 * Only pass ioctls through if the device sizes match exactly.
-	 */
-	if (fcc->start ||
-	    ti->len != i_size_read(dev->bdev->bd_inode) >> SECTOR_SHIFT)
-		r = scsi_verify_blk_ioctl(NULL, cmd);
-
-	return r ? : __blkdev_driver_ioctl(dev->bdev, dev->mode, cmd, arg);
+	return r;
 }
-
+/*
 static int foolcache_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
 			struct bio_vec *biovec, int max_size)
 {
@@ -560,6 +592,14 @@ static int foolcache_iterate_devices(struct dm_target *ti,
 
 	return fn(ti, fcc->dev, fcc->start, ti->len, data);
 }
+*/
+
+static int foolcache_map(struct dm_target *ti, struct bio *bio,
+		      union map_info *map_context)
+{
+	struct foolcache_c *fcc = ti->private;
+	return foolcache_map_sync(fcc, bio);
+}
 
 static struct target_type foolcache_target = {
 	.name   = "foolcache",
@@ -567,11 +607,11 @@ static struct target_type foolcache_target = {
 	.module = THIS_MODULE,
 	.ctr    = foolcache_ctr,
 	.dtr    = foolcache_dtr,
-	.map    = foolcache_map_sync,
+	.map    = foolcache_map,
 	.status = foolcache_status,
 	.ioctl  = foolcache_ioctl,
-	.merge  = foolcache_merge,
-	.iterate_devices = foolcache_iterate_devices,
+//	.merge  = foolcache_merge,
+//	.iterate_devices = foolcache_iterate_devices,
 };
 
 int __init dm_foolcache_init(void)
@@ -586,7 +626,7 @@ int __init dm_foolcache_init(void)
 
 void dm_foolcache_exit(void)
 {
-	dm_unregister_target(&linear_target);
+	dm_unregister_target(&foolcache_target);
 }
 
 
