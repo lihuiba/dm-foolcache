@@ -90,7 +90,7 @@ static int write_ender(struct foolcache_c* fcc)
 	region.sector = fcc->sectors - 1;
 	region.count = 1;
 	io_req.mem.ptr.addr = fcc->header;
-//	r = dm_io(&io_req, 1, &region, NULL);
+	r = dm_io(&io_req, 1, &region, NULL);
 	return r;
 }
 
@@ -333,9 +333,9 @@ static void fc_map(struct foolcache_c* fcc, struct bio* bio)
 static int copy_block(struct foolcache_c* fcc, unsigned int block)
 {
 	int r = 0;
-	char buf[fcc->block_size];
 	struct dm_io_region region;
 	struct dm_io_request io_req;
+	char* buf;
 
 	// before copying
 	if (fcc->bypassing || test_bit(block, fcc->bitmap)) return 0;
@@ -361,12 +361,12 @@ retry:
 	region.count = fcc->block_size,
 	io_req.bi_rw = READ,
 	io_req.mem.type = DM_IO_VMA,
-	io_req.mem.ptr.vma = buf,
+	io_req.mem.ptr.vma = vmalloc(fcc->block_size),
 	// io_req.notify.fn = ,
 	// io_req.notify.context = ,
 	io_req.client = fcc->io_client,
 	r=dm_io(&io_req, 1, &region, NULL);
-	if (r!=0) goto out;
+	if (r!=0) goto out2;
 
 	// do writing
 	io_req.bi_rw = WRITE;
@@ -376,10 +376,12 @@ retry:
 	{
 		r = 0;	// do NOT report write errors
 		fcc->bypassing = 1;	// and bypass cache
-		goto out;
+		goto out2;
 	}
 	set_bit(block, fcc->bitmap);
 
+out2:
+	vfree(io_req.mem.ptr.vma);
 out:// after copying
 	clear_bit(block, fcc->copying);
 	complete_all(&fcc->copied);
@@ -435,7 +437,7 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		return -EINVAL;
 	}
 
-	fcc = vzalloc(sizeof(*fcc), GFP_KERNEL);
+	fcc = vzalloc(sizeof(*fcc));
 	if (fcc == NULL) {
 		ti->error = "dm-foolcache: Cannot allocate foolcache context";
 		return -ENOMEM;
@@ -470,9 +472,9 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	fcc->bitmap_sectors = fcc->sectors/bs/8/512 + 1; 	// sizeof bitmap, in sector
 	fcc->last_caching_sector = fcc->sectors - 1 - 1 - fcc->bitmap_sectors;
 	bitmap_size = fcc->bitmap_sectors*512;
-	fcc->bitmap = vzalloc(bitmap_size, GFP_KERNEL);
-	fcc->copying = vzalloc(bitmap_size, GFP_KERNEL);
-	fcc->header = vzalloc(512, GFP_KERNEL);
+	fcc->bitmap = vzalloc(bitmap_size);
+	fcc->copying = vzalloc(bitmap_size);
+	fcc->header = vzalloc(512);
 	if (fcc->bitmap==NULL || fcc->copying==NULL || fcc->header==NULL)
 	{
 		ti->error = "dm-foolcache: Cannot allocate bitmaps";
@@ -512,6 +514,7 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	ti->num_flush_requests = 1;
 	ti->num_discard_requests = 1;
 	ti->private = fcc;
+	printk("dm-foolcache: ctor succeeed\n");
 	return 0;
 
 bad5:
@@ -526,6 +529,7 @@ bad2:
 	dm_put_device(ti, fcc->origin);
 bad1:
 	vfree(fcc);
+	printk("dm-foolcache: ctor failed\n");
 	return -EINVAL;
 }
 
