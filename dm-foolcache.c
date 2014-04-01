@@ -453,7 +453,9 @@ static int copy_block2(struct foolcache_c* fcc, unsigned int block)
 	if (test_and_set_bit(block, fcc->copying))
 	{	// the block is being copied by another thread, let's just wait
 wait:
+		printk("dm-foolcache: pre-wait\n");
 		wait_for_completion_timeout(&fcc->copied, 1*HZ);
+		printk("dm-foolcache: post-wait\n");
 		if (fcc->bypassing)
 		{
 			return -EIO;
@@ -475,13 +477,16 @@ wait:
 	job.fcc = fcc;
 	job.block = block;
 	job.origin.bdev = fcc->origin->bdev;
+	job.cache.bdev = fcc->cache->bdev;
 	job.origin.sector = job.cache.sector = block2sector(fcc, block);
 	job.origin.count = job.cache.count = fcc->block_size;	
 // int dm_kcopyd_copy(struct dm_kcopyd_client *kc, struct dm_io_region *from,
 // 		   unsigned num_dests, struct dm_io_region *dests,
 // 		   unsigned flags, dm_kcopyd_notify_fn fn, void *context);
+	printk("dm-foolcache: pre-kcopyd\n");
 	dm_kcopyd_copy(fcc->kcopyd_client, &job.origin, 1, &job.cache, 
 		0, copy_block2_callback, &job);
+	printk("dm-foolcache: post-kcopyd\n");
 	goto wait;
 }
 
