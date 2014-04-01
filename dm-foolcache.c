@@ -360,7 +360,6 @@ static int read_origin(struct foolcache_c* fcc, unsigned long block, void* buf)
 	return r;
 }
 
-<<<<<<< HEAD
 static int write_cache(struct foolcache_c* fcc, unsigned int block, void* buf)
 {
 	int r;
