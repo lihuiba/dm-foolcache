@@ -43,19 +43,8 @@ struct foolcache_c {
 	unsigned int bitmap_sectors;
 	struct completion copied;
 	struct dm_kcopyd_client* kcopyd_client;
-//	struct job_kcopyd* queue;
-//	spinlock_t qlock;
 };
-/*
-struct job_kcopyd {
-	struct job_kcopyd* next;
-	struct bio* bio;
-	struct foolcache_c* fcc;
-	unsigned int bi_size;
-	unsigned long current_block, end_blocks;
-	struct dm_io_region origin, cache;
-};
-*/
+
 struct job2_kcopyd {
 	struct foolcache_c* fcc;
 	unsigned long block;
@@ -130,302 +119,6 @@ static int read_ender(struct foolcache_c* fcc)
 	return r;
 }
 
-/*
-static void job_bio_callback_done(unsigned long error, void *context)
-{
-	struct bio* bio = context;
-	bio_endio(bio, error);
-}
-
-static void job_bio_callback_further(unsigned long error, void *context)
-{
-	struct bio* bio = context;
-	if (unlikely(error))
-	{
-		bio_endio(bio, error);
-	}
-
-	bio->bi_bdev = fcc->origin->bdev;
-	bio->bi_sector += bio->bi_size;
-	bio->bi_size = job->bi_size - bio->bi_size;
-	do_bio(fcc, bio, job_bio_callback_done, NULL);
-}
-
-static void do_bio(struct foolcache_c* fcc, struct bio* bio, io_notify_fn callback, void* ctx)
-{
-	struct dm_io_region region = {
-		.bdev = bio->bdev,
-		.sector = bio->bi_sector,
-		.count = bio_sectors(bio),
-	};
-	struct dm_io_request io_req = {
-		.bi_rw = READ,
-		.mem.type = DM_IO_BVEC,
-		.mem.ptr.bvec = bio->bi_io_vec + bio->bi_idx,
-		.notify.fn = callback,
-		.notify.context = ctx,
-		.client = fcc->io_client,
-	};
-	BUG_ON(dm_io(&io_req, 1, &region, NULL));
-}
-
-void split_bio(struct bio* bio)
-{
-	unsigned int bi_size = bio->bi_size;
-	bio->bi_bdev = fcc->cache->bdev;
-	bio->bi_size = (fcc->last_caching_sector - bio->bi_sector) * 512;
-	do_bio(fcc, bio, job_bio_callback_further, (void*)bi_size);
-}
-
-static void copy_block_async(struct job_kcopyd* job);
-void kcopyd_do_callback(int read_err, unsigned long write_err, void *context)
-{
-	bool no_intersection;
-	struct job_kcopyd* job = context;
-	struct foolcache_c* fcc = job->fcc;
-	unsigned long block = job->current_block;
-
-	if (unlikely(read_err))
-	{
-		bio_endio(bio, -EIO);
-		mempool_free(job, fcc->job_pool);
-		return;
-	}
-
-	if (unlikely(write_err))
-	{
-		fcc->bypassing = 1;
-		bio->bi_bdev = fcc->origin->bdev;
-		do_bio(fcc, bio, do_jobbio_callback_done);
-		mempool_free(job, fcc->job_pool);
-		return;
-	}
-
-	set_bit(block, fcc_.bitmap);
-	block = find_next_missing_block(fcc, ++block);
-	if (block!=-1)
-	{
-		job->current_block = block;
-		copy_block_async(job);
-		return;
-	}
-
-	// copy done, read from cache
-	no_intersection = (job->end_block <= fcc->last_caching_block);
-	mempool_free(job, fcc->job_pool);
-	if (likely(no_intersection))
-	{	// the I/O region doesn't involve the ender, do it as a whole
-		bio->bi_bdev = fcc->cache->bdev;
-		do_bio(fcc,bio, do_jobbio_callback_done);
-	}
-	else do_bio_split(bio);	// the I/O region involves the ender, do it seperately
-}
-
-struct job_kcopyd* queued_job_for_block(struct foolcache_c* fcc, unsigned long block)
-{
-	struct job_kcopyd* next;
-	struct job_kcopyd* q = NULL;
-	struct job_kcopyd* prev = NULL;
-	struct job_kcopyd* node = fcc->queue;
-	while (node)
-	{
-		next = node->next;
-		if (block == node->current_block)
-		{	// remove it from old queue, and insert it into new queue
-			if (prev) prev->next = node->next;
-			else fcc->queue = node->next;
-			node->next = q;
-			q = node;
-		}
-		prev = node;
-		node = next;
-	}
-	return q;
-}
-
-void copy_block_callback(int read_err, unsigned long write_err, void *context)
-{
-	struct job_kcopyd* qjob;
-	struct job_kcopyd* job = context;
-	struct foolcache_c* fcc = job->fcc;
-	unsigned long block = job->current_block;
-
-	spin_lock_irq(fcc->qlock);
-	clear_bit(block, fcc->copying);
-	qjob = queued_job_for_block(fcc, block);
-	spin_unlock_irq(fcc->qlock);
-
-	while (qjob)
-	{
-		kcopyd_do_callback(read_err, write_err, qjob);
-		qjob = qjob->next;
-	}
-	kcopyd_do_callback(read_err, write_err, job);
-}
-
-static void copy_block_async(struct job_kcopyd* job)
-{
-	struct foolcache_c* fcc = job->fcc;
-	job->origin.sector = job->cache.sector = 
-		(job->current_block << fcc->block_shift);
-
-	spin_lock_irq(fcc->qlock);
-	if (test_bit(job->current_block, fcc->copying))
-	{	// the block is being copied by another thread, let's wait in queue
-		job->next = fcc->queue;
-		fcc->queue = job;
-		spin_unlock_irq(fcc->qlock);
-		return;
-	}
-	set_bit(job->current_block, fcc->copying);
-	spin_unlock_irq(fcc->qlock);
-
-
-// int dm_kcopyd_copy(struct dm_kcopyd_client *kc, struct dm_io_region *from,
-// 		   unsigned num_dests, struct dm_io_region *dests,
-// 		   unsigned flags, dm_kcopyd_notify_fn fn, void *context);
-	dm_kcopyd_copy(fcc->kcopyd_client, &job->origin, 1, &job->cache, 
-		0, kcopyd_callback, job);
-}
-
-unsigned long find_next_missing_block(struct foolcache_c* fcc, 
-	unsigned long start, unsigned long end)
-{
-	if (end > fcc->last_caching_block) 
-	{
-		end = fcc->last_caching_block;
-	}
-	for (; start<=end; ++start)
-	{
-		if (!test_bit(start, fcc->bitmap))
-		{
-			return start;
-		}
-	}
-	return -1;
-}
-
-static void fc_map(struct foolcache_c* fcc, struct bio* bio)
-{
-	unsigned long start_block = sector2block(bio->bi_sector);
-	unsigned long end_block = sector2block(bio->bi_sector + bio->bi_size/512);
-	unsigned long i = find_next_missing_block(fcc, start, end);
-
-	if (i!=-1)
-	{	// found a missing block
-		struct job* = mempool_alloc(fcc->job_pool, GFP_NOIO);
-		job->fcc = fcc;
-		job->bio = bio;
-		job->current_block = i;
-		job->end_block = end_block;
-		job->origin->bdev = fcc->origin->bdev;
-		job->cache->bdev = fcc->cache->bdev;
-		job->origin.count = fcc->block_size;
-		job->cache.count = fcc->block_size;
-		kcopyd(job);
-		return DM_MAPIO_SUBMITTED;
-	}
-
-	if (end_block > fcc->last_caching_block)
-	{
-		do_bio_split(bio);
-		return DM_MAPIO_SUBMITTED;
-	}
-
-	bio->bi_bdev = fcc->cache->bdev;
-	return DM_MAPIO_REMAPPED;
-}
-*/
-
-static int read_origin(struct foolcache_c* fcc, unsigned long block, void* buf)
-{
-	int r;
-	struct dm_io_region region = {
-		.bdev = fcc->origin->bdev,
-		.sector = block2sector(fcc, block),
-		.count = fcc->block_size,
-	};
-	struct dm_io_request io_req = {
-		.bi_rw = READ,
-		.mem.type = DM_IO_VMA,
-		.mem.ptr.vma = buf,
-		// .notify.fn = ,
-		// .notify.context = ,
-		.client = fcc->io_client,
-	};
-
-	printk("dm-foolcache: asdf2 block=%llu, bs=%u\n", block, fcc->block_size);
-	r=dm_io(&io_req, 1, &region, NULL);
-	printk("dm-foolcache: -asdf2\n");
-	return r;
-}
-
-static int write_cache(struct foolcache_c* fcc, unsigned int block, void* buf)
-{
-	int r;
-	struct dm_io_region region = {
-		.bdev = fcc->cache->bdev,
-		.sector = block2sector(fcc, block),
-		.count = fcc->block_size,
-	};
-	struct dm_io_request io_req = {
-		.bi_rw = WRITE,
-		.mem.type = DM_IO_VMA,
-		.mem.ptr.vma = buf,
-		// .notify.fn = ,
-		// .notify.context = ,
-		.client = fcc->io_client,
-	};
-	r=dm_io(&io_req, 1, &region, NULL);
-	return r;
-}
-
-
-static int copy_block(struct foolcache_c* fcc, unsigned long block)
-{
-	int r = 0;
-	char* buf;
-	// before copying
-	if (fcc->bypassing || test_bit(block, fcc->bitmap)) return 0;
-	if (test_and_set_bit(block, fcc->copying))
-	{	// the block is being copied by another thread, let's just wait
-retry:
-		wait_for_completion_timeout(&fcc->copied, 1*HZ);
-		if (fcc->bypassing)
-		{
-			return -EIO;
-		}
-		if (test_bit(block, fcc->copying))
-		{
-			goto retry;
-		}
-		return 0;
-	}
-	if (test_bit(block, fcc->bitmap)) goto out;
-
-	// do reading
-	buf=vmalloc(fcc->block_size*512);
-	r=read_origin(fcc, block, buf);
-	if (r!=0) goto out2;
-
-	// do writing
-	r=write_cache(fcc, block, buf);
-	if (r!=0)
-	{
-		r = 0;	// do NOT report write errors
-		fcc->bypassing = 1;	// and bypass cache
-		goto out2;
-	}
-	set_bit(block, fcc->bitmap);
-
-out2:
-	vfree(buf);
-out:// after copying
-	clear_bit(block, fcc->copying);
-	complete_all(&fcc->copied);
-	return r;
-}
-
 void copy_block2_callback(int read_err, unsigned long write_err, void *context)
 {
 	struct job2_kcopyd* job = context;
@@ -453,9 +146,9 @@ static int copy_block2(struct foolcache_c* fcc, unsigned int block)
 	if (test_and_set_bit(block, fcc->copying))
 	{	// the block is being copied by another thread, let's just wait
 wait:
-		printk("dm-foolcache: pre-wait\n");
+		//printk("dm-foolcache: pre-wait\n");
 		wait_for_completion_timeout(&fcc->copied, 1*HZ);
-		printk("dm-foolcache: post-wait\n");
+		//printk("dm-foolcache: post-wait\n");
 		if (fcc->bypassing)
 		{
 			return -EIO;
@@ -480,16 +173,10 @@ wait:
 	job.cache.bdev = fcc->cache->bdev;
 	job.origin.sector = job.cache.sector = block2sector(fcc, block);
 	job.origin.count = job.cache.count = fcc->block_size;	
-// int dm_kcopyd_copy(struct dm_kcopyd_client *kc, struct dm_io_region *from,
-// 		   unsigned num_dests, struct dm_io_region *dests,
-// 		   unsigned flags, dm_kcopyd_notify_fn fn, void *context);
-	printk("dm-foolcache: pre-kcopyd\n");
 	dm_kcopyd_copy(fcc->kcopyd_client, &job.origin, 1, &job.cache, 
 		0, copy_block2_callback, &job);
-	printk("dm-foolcache: post-kcopyd\n");
 	goto wait;
 }
-
 
 static int foolcache_map_sync(struct foolcache_c* fcc, struct bio* bio)
 {
@@ -673,7 +360,7 @@ static int foolcache_status(struct dm_target *ti, status_type_t type,
 
 	case STATUSTYPE_TABLE:
 		snprintf(result, maxlen, "%s %s %u", fcc->origin->name, 
-			fcc->cache->name, fcc->block_size*(1024/512));
+			fcc->cache->name, fcc->block_size*512/1024);
 		break;
 	}
 	return 0;
