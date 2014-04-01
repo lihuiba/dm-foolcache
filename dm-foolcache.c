@@ -181,7 +181,7 @@ wait:
 static int foolcache_map_sync(struct foolcache_c* fcc, struct bio* bio)
 {
 	sector_t last_sector;
-	if (bio->bi_rw==WRITE)
+	if (bio->bi_rw & WRITE)
 	{
 		bio_endio(bio, -EROFS);
 		return DM_MAPIO_SUBMITTED;
