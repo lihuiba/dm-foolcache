@@ -337,7 +337,7 @@ static void fc_map(struct foolcache_c* fcc, struct bio* bio)
 }
 */
 
-static int read_origin(struct foolcache_c* fcc, unsigned int block, void* buf)
+static int read_origin(struct foolcache_c* fcc, unsigned long block, void* buf)
 {
 	int r;
 	struct dm_io_region region = {
@@ -353,12 +353,14 @@ static int read_origin(struct foolcache_c* fcc, unsigned int block, void* buf)
 		// .notify.context = ,
 		.client = fcc->io_client,
 	};
-	printk("dm-foolcache: asdf2\n");
+
+	printk("dm-foolcache: asdf2 block=%llu, bs=%u\n", block, fcc->block_size);
 	r=dm_io(&io_req, 1, &region, NULL);
 	printk("dm-foolcache: -asdf2\n");
 	return r;
 }
 
+<<<<<<< HEAD
 static int write_cache(struct foolcache_c* fcc, unsigned int block, void* buf)
 {
 	int r;
@@ -380,7 +382,7 @@ static int write_cache(struct foolcache_c* fcc, unsigned int block, void* buf)
 }
 
 
-static int copy_block(struct foolcache_c* fcc, unsigned int block)
+static int copy_block(struct foolcache_c* fcc, unsigned long block)
 {
 	int r = 0;
 	char* buf;
@@ -403,7 +405,7 @@ retry:
 	if (test_bit(block, fcc->bitmap)) goto out;
 
 	// do reading
-	buf=vmalloc(fcc->block_size);
+	buf=vmalloc(fcc->block_size*512);
 	r=read_origin(fcc, block, buf);
 	if (r!=0) goto out2;
 
