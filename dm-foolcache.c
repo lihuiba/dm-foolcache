@@ -119,7 +119,7 @@ static int read_ender(struct foolcache_c* fcc)
 	return r;
 }
 
-void copy_block2_callback(int read_err, unsigned long write_err, void *context)
+void copy_block_callback(int read_err, unsigned long write_err, void *context)
 {
 	struct job2_kcopyd* job = context;
 	struct foolcache_c* fcc = job->fcc;
@@ -137,7 +137,7 @@ void copy_block2_callback(int read_err, unsigned long write_err, void *context)
 	complete_all(&fcc->copied);
 }
 
-static int copy_block2(struct foolcache_c* fcc, unsigned int block)
+static int copy_block(struct foolcache_c* fcc, unsigned int block)
 {
 	struct job2_kcopyd job;
 
@@ -174,7 +174,7 @@ wait:
 	job.origin.sector = job.cache.sector = block2sector(fcc, block);
 	job.origin.count = job.cache.count = fcc->block_size;	
 	dm_kcopyd_copy(fcc->kcopyd_client, &job.origin, 1, &job.cache, 
-		0, copy_block2_callback, &job);
+		0, copy_block_callback, &job);
 	goto wait;
 }
 
@@ -200,7 +200,7 @@ static int foolcache_map_sync(struct foolcache_c* fcc, struct bio* bio)
 		{
 			if (!test_bit(i, fcc->bitmap))
 			{
-				copy_block2(fcc, i);
+				copy_block(fcc, i);
 			}		
 		}
 		bio->bi_bdev = fcc->bypassing ? fcc->origin->bdev : fcc->cache->bdev;
@@ -369,7 +369,7 @@ static int foolcache_status(struct dm_target *ti, status_type_t type,
 static int foolcache_ioctl(struct dm_target *ti, unsigned int cmd,
 			unsigned long arg)
 {
-	struct foolcache_c *fcc = ti->private;
+//	struct foolcache_c *fcc = ti->private;
 	int r = 0;
 
 	// if (cmd==FIEMAP)
@@ -394,15 +394,18 @@ static int foolcache_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
 
 	return min(max_size, q->merge_bvec_fn(q, bvm, biovec));
 }
-
+*/
 static int foolcache_iterate_devices(struct dm_target *ti,
 				  iterate_devices_callout_fn fn, void *data)
 {
+	int r;
 	struct foolcache_c *fcc = ti->private;
-
-	return fn(ti, fcc->dev, fcc->start, ti->len, data);
+	r = fn(ti, fcc->origin, 0, fcc->sectors, data);
+	if (r) return r;
+	r = fn(ti, fcc->cache, 0, fcc->sectors, data);
+	return r;
 }
-*/
+
 
 static int foolcache_map(struct dm_target *ti, struct bio *bio,
 		      union map_info *map_context)
@@ -421,7 +424,7 @@ static struct target_type foolcache_target = {
 	.status = foolcache_status,
 	.ioctl  = foolcache_ioctl,
 //	.merge  = foolcache_merge,
-//	.iterate_devices = foolcache_iterate_devices,
+	.iterate_devices = foolcache_iterate_devices,
 };
 
 int __init dm_foolcache_init(void)
