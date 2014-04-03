@@ -33,16 +33,19 @@ struct foolcache_c {
 	struct dm_dev* origin;
 	struct dm_io_client* io_client;
 	unsigned int bypassing;
-	unsigned long sectors, last_caching_sector;
+	sector_t sectors, last_caching_sector;
 	unsigned int block_size;		// block (chunk) size, in sector
 	unsigned int block_shift;
 	unsigned int block_mask;
 	unsigned long* bitmap;
 	unsigned long* copying;
+	unsigned long bitmap_modified;
+	unsigned long bitmap_last_sync;
 	struct header* header;
 	unsigned int bitmap_sectors;
 	struct completion copied;
 	struct dm_kcopyd_client* kcopyd_client;
+	unsigned long cached_blocks, hits, misses;
 };
 
 struct job2_kcopyd {
@@ -61,32 +64,85 @@ static inline sector_t block2sector(struct foolcache_c* fcc, unsigned long block
 	return block << fcc->block_shift;
 }
 
-static int write_ender(struct foolcache_c* fcc)
+inline unsigned char cout_bits_uchar(unsigned char x)
+{
+	return (x&1) + ((x>>1)&1) + ((x>>2)&1) + ((x>>3)&1)
+		 + ((x>>4)&1) + ((x>>5)&1) + ((x>>6)&1) + ((x>>7));
+}
+
+static unsigned long count_bits(unsigned long* buf, unsigned long size)
+{
+	unsigned long i, r;
+	unsigned char table[256];
+	unsigned char* _buf = (unsigned char*)buf;
+	for (i=0; i<256; ++i)
+	{
+		table[i] = cout_bits_uchar(i);
+	}
+	for (i=r=0; i<size/sizeof(_buf[0]); ++i)
+	{
+		r+=table[_buf[i]];
+	}
+	for (i*=sizeof(_buf[0]); i<size; ++i)
+	{
+		r+=test_bit(i, buf);
+	}
+	return r;
+}
+
+static int write_bitmap(struct foolcache_c* fcc)
+{
+	int r;
+	struct dm_io_region region;
+	struct dm_io_request io_req;
+	
+	if (fcc->bitmap_modified == 0)
+	{
+		return 0;
+	}
+
+	region.bdev = fcc->cache->bdev;
+	region.sector = fcc->sectors - (fcc->bitmap_sectors + 1);
+	region.count = fcc->bitmap_sectors;
+	io_req.bi_rw = WRITE;
+	io_req.mem.type = DM_IO_VMA;
+	io_req.mem.ptr.vma = fcc->bitmap;
+	io_req.notify.fn = NULL;
+	// io_req.notify.context = NULL;
+	io_req.client = fcc->io_client;
+
+	r=dm_io(&io_req, 1, &region, NULL);
+	if (r!=0) return r;
+	fcc->bitmap_modified = 0;
+	return 0;
+}
+
+static int write_header(struct foolcache_c* fcc)
 {
 	int r;
 	struct dm_io_region region = {
 		.bdev = fcc->cache->bdev,
-		.sector = fcc->sectors - (fcc->bitmap_sectors + 1),
-		.count = fcc->bitmap_sectors,
+		.sector = fcc->sectors - 1,
+		.count = 1,
 	};
 	struct dm_io_request io_req = {
 		.bi_rw = WRITE,
 		.mem.type = DM_IO_VMA,
-		.mem.ptr.vma = fcc->bitmap,
+		.mem.ptr.vma = fcc->header,
 		// .notify.fn = ,
 		// .notify.context = ,
 		.client = fcc->io_client,
 	};
-	r=dm_io(&io_req, 1, &region, NULL);
-	if (r!=0) return r;
 
 	memcpy(fcc->header->signature, SIGNATURE, sizeof(SIGNATURE));
 	fcc->header->block_size = fcc->block_size;
-	region.sector = fcc->sectors - 1;
-	region.count = 1;
-	io_req.mem.ptr.addr = fcc->header;
 	r = dm_io(&io_req, 1, &region, NULL);
 	return r;
+}
+
+static inline int write_ender(struct foolcache_c* fcc)
+{
+	return write_bitmap(fcc) || write_header(fcc);
 }
 
 static int read_ender(struct foolcache_c* fcc)
@@ -116,6 +172,7 @@ static int read_ender(struct foolcache_c* fcc)
 	region.sector = fcc->last_caching_sector + 1;
 	region.count = fcc->bitmap_sectors;
 	r = dm_io(&io_req, 1, &region, NULL);
+	if (r==0) fcc->bitmap_modified = 0;
 	return r;
 }
 
@@ -131,20 +188,29 @@ void copy_block_callback(int read_err, unsigned long write_err, void *context)
 	else
 	{
 		set_bit(block, fcc->bitmap);
+		fcc->cached_blocks++;
+		fcc->bitmap_modified = 1;
 	}
 
 	clear_bit(block, fcc->copying);
 	complete_all(&fcc->copied);
 }
 
-static int copy_block(struct foolcache_c* fcc, unsigned int block)
+static int ensure_block(struct foolcache_c* fcc, unsigned int block)
 {
 	struct job2_kcopyd job;
 
+	if (fcc->bypassing) return 0;
+	if (test_bit(block, fcc->bitmap))
+	{
+		fcc->hits++;
+		return 0;
+	}
+
 	// before copying
-	if (fcc->bypassing || test_bit(block, fcc->bitmap)) return 0;	
 	if (test_and_set_bit(block, fcc->copying))
 	{	// the block is being copied by another thread, let's just wait
+		fcc->hits++;
 wait:
 		//printk("dm-foolcache: pre-wait\n");
 		wait_for_completion_timeout(&fcc->copied, 1*HZ);
@@ -162,11 +228,13 @@ wait:
 
 	if (test_bit(block, fcc->bitmap))
 	{
+		fcc->hits++;
 		clear_bit(block, fcc->copying);
 		return 0;
 	}
 
 	// do copying
+	fcc->misses++;
 	job.fcc = fcc;
 	job.block = block;
 	job.origin.bdev = fcc->origin->bdev;
@@ -181,6 +249,12 @@ wait:
 static int foolcache_map_sync(struct foolcache_c* fcc, struct bio* bio)
 {
 	sector_t last_sector;
+	u64 now = get_jiffies_64();
+	if (fcc->bitmap_last_sync+HZ*10 < now || now < fcc->bitmap_last_sync)
+	{
+		write_bitmap(fcc);
+	}
+
 	if (bio_data_dir(bio) == WRITE)
 	{
 		return -EIO;
@@ -197,10 +271,7 @@ static int foolcache_map_sync(struct foolcache_c* fcc, struct bio* bio)
 		unsigned long i = sector2block(fcc, bio->bi_sector);
 		for (; i<=end_block; ++i)
 		{
-			if (!test_bit(i, fcc->bitmap))
-			{
-				copy_block(fcc, i);
-			}		
+			ensure_block(fcc, i);
 		}
 		bio->bi_bdev = fcc->bypassing ? fcc->origin->bdev : fcc->cache->bdev;
 	}
@@ -260,7 +331,6 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	fcc->block_shift = ffs(bs)-1;
 	fcc->block_mask = ~(bs-1);
 	printk("dm-foolcache: bshift %u, bmask %u\n", fcc->block_shift, fcc->block_mask);
-
 	fcc->bitmap_sectors = fcc->sectors/bs/8/512 + 1; 	// sizeof bitmap, in sector
 	fcc->last_caching_sector = fcc->sectors - 1 - 1 - fcc->bitmap_sectors;
 	bitmap_size = fcc->bitmap_sectors*512;
@@ -287,11 +357,15 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad5;
 	}
 
+	fcc->hits = 0;
+	fcc->misses = 0;
 	memset(fcc->copying, 0, bitmap_size);
 	if (argc>=4 && strcmp(argv[3], "create")==0)
 	{	// create new cache
 		memset(fcc->bitmap, 0, bitmap_size);
-		r=write_ender(fcc);
+		fcc->bitmap_modified = 1;
+		fcc->cached_blocks = 0;
+		r = write_ender(fcc);
 		if (r!=0)
 		{
 			ti->error = "dm-foolcache: ender write error";
@@ -300,13 +374,15 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 	else
 	{	// open existing cache
-		r=read_ender(fcc);
+		r = read_ender(fcc);
+		fcc->cached_blocks = count_bits(fcc->bitmap, fcc->sectors);
 		if (r!=0)
 		{
 			ti->error = "dm-foolcache: ender read error";
 			goto bad6;
 		}
 	}
+	fcc->bitmap_last_sync = jiffies;
 
 	init_completion(&fcc->copied);
 
@@ -337,6 +413,7 @@ bad1:
 static void foolcache_dtr(struct dm_target *ti)
 {
 	struct foolcache_c *fcc = ti->private;
+	write_bitmap(fcc);
 	vfree(fcc->bitmap);
 	vfree(fcc->copying);
 	vfree(fcc->header);
@@ -347,8 +424,8 @@ static void foolcache_dtr(struct dm_target *ti)
 	vfree(fcc);
 }
 
-static int foolcache_status(struct dm_target *ti, status_type_t type,
-			 char *result, unsigned int maxlen)
+static void foolcache_status(struct dm_target *ti, status_type_t type,
+		char *result, unsigned int maxlen)
 {
 	struct foolcache_c *fcc = ti->private;
 
@@ -362,7 +439,6 @@ static int foolcache_status(struct dm_target *ti, status_type_t type,
 			fcc->cache->name, fcc->block_size*512/1024);
 		break;
 	}
-	return 0;
 }
 
 static int foolcache_ioctl(struct dm_target *ti, unsigned int cmd,
