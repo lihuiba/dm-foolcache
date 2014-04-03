@@ -12,6 +12,8 @@
 #include <linux/device-mapper.h>
 #include <linux/dm-kcopyd.h>
 #include <linux/dm-io.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 
 #define DM_MSG_PREFIX "foolcache"
 
@@ -53,6 +55,8 @@ struct job2_kcopyd {
 	unsigned long block;
 	struct dm_io_region origin, cache;
 };
+
+static struct proc_dir_entry* fcdir_proc;
 
 static inline unsigned long sector2block(struct foolcache_c* fcc, sector_t sector)
 {
@@ -502,12 +506,54 @@ static struct target_type foolcache_target = {
 	.iterate_devices = foolcache_iterate_devices,
 };
 
+static inline void print_percent(struct seq_file *m, const char* title, 
+	unsigned long a, unsigned long b)
+{
+	unsigned int x = b ? a*100/b : 0;
+	unsigned int y = b ? (a*1000/b)%10 : 0;
+	seq_printf(m, "%s: %lu/%lu (%u.%u%%)\n", title, a, b, x, y);
+}
+
+static int foolcache_proc_show(struct seq_file *m, void *v)
+{
+	struct foolcache_c *fcc = v;
+	unsigned long blocks = sector2block(fcc, fcc->sectors) + 1;
+	print_percent(m, "Hit", fcc->hits, fcc->hits + fcc->misses);
+	print_percent(m, "Fullfillment", fcc->cached_blocks, blocks);
+	return 0;
+}
+
+static int foolcache_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, foolcache_proc_show, PDE(inode)->data);
+}
+
+static const struct file_operations foolcache_proc_fops = {
+	.open		= foolcache_proc_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+static inline void proc_new_entry(struct foolcache_c* fcc, const char* name)
+{
+// proc_create_data(const char *name, umode_t mode,
+// 					struct proc_dir_entry *parent,
+// 					const struct file_operations *proc_fops,
+// 					void *data)
+	proc_create_data(name, S_IRUGO, fcdir_proc, &foolcache_proc_fops, fcc);
+}
+
+
 int __init dm_foolcache_init(void)
 {
 	int r = dm_register_target(&foolcache_target);
-
 	if (r < 0)
+	{
 		DMERR("register failed %d", r);
+	}
+
+	fcdir_proc = proc_mkdir("foolcache", NULL);
 
 	return r;
 }
@@ -515,6 +561,7 @@ int __init dm_foolcache_init(void)
 void dm_foolcache_exit(void)
 {
 	dm_unregister_target(&foolcache_target);
+	remove_proc_entry("foolcache", NULL);
 }
 
 
