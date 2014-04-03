@@ -57,6 +57,8 @@ struct job2_kcopyd {
 };
 
 static struct proc_dir_entry* fcdir_proc;
+static inline void proc_new_entry(struct foolcache_c* fcc);
+static inline void proc_remove_entry(struct foolcache_c* fcc);
 
 static inline unsigned long sector2block(struct foolcache_c* fcc, sector_t sector)
 {
@@ -389,6 +391,7 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	fcc->bitmap_last_sync = jiffies;
 
 	init_completion(&fcc->copied);
+	proc_new_entry(fcc);
 
 	ti->num_flush_requests = 1;
 	ti->num_discard_requests = 1;
@@ -421,6 +424,7 @@ static void foolcache_dtr(struct dm_target *ti)
 	vfree(fcc->bitmap);
 	vfree(fcc->copying);
 	vfree(fcc->header);
+	proc_remove_entry(fcc);
 	dm_kcopyd_client_destroy(fcc->kcopyd_client);
 	dm_io_client_destroy(fcc->io_client);
 	dm_put_device(ti, fcc->origin);
@@ -517,7 +521,14 @@ static inline void print_percent(struct seq_file *m, const char* title,
 static int foolcache_proc_show(struct seq_file *m, void *v)
 {
 	struct foolcache_c *fcc = v;
-	unsigned long blocks = sector2block(fcc, fcc->sectors) + 1;
+	unsigned long blocks;
+	if (fcc==NULL)
+	{
+		seq_puts(m, "NULL");
+		return 0;
+	}
+
+	blocks = sector2block(fcc, fcc->sectors) + 1;
 	print_percent(m, "Hit", fcc->hits, fcc->hits + fcc->misses);
 	print_percent(m, "Fullfillment", fcc->cached_blocks, blocks);
 	return 0;
@@ -535,15 +546,20 @@ static const struct file_operations foolcache_proc_fops = {
 	.release	= single_release,
 };
 
-static inline void proc_new_entry(struct foolcache_c* fcc, const char* name)
+static inline void proc_new_entry(struct foolcache_c* fcc)
 {
 // proc_create_data(const char *name, umode_t mode,
 // 					struct proc_dir_entry *parent,
 // 					const struct file_operations *proc_fops,
 // 					void *data)
-	proc_create_data(name, S_IRUGO, fcdir_proc, &foolcache_proc_fops, fcc);
+	proc_create_data(fcc->origin->name, 
+		S_IRUGO, fcdir_proc, &foolcache_proc_fops, fcc);
 }
 
+static inline void proc_remove_entry(struct foolcache_c* fcc)
+{
+	remove_proc_entry(fcc->origin->name, fcdir_proc);
+}
 
 int __init dm_foolcache_init(void)
 {
