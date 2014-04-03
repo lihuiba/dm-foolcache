@@ -518,17 +518,14 @@ static inline void print_percent(struct seq_file *m, const char* title,
 	seq_printf(m, "%s: %lu/%lu (%u.%u%%)\n", title, a, b, x, y);
 }
 
-static int foolcache_proc_show(struct seq_file *m, void *v)
+static int foolcache_proc_show(struct seq_file* m, void* v)
 {
-	struct foolcache_c *fcc = v;
-	unsigned long blocks;
-	if (fcc==NULL)
-	{
-		seq_puts(m, "NULL");
-		return 0;
-	}
-
-	blocks = sector2block(fcc, fcc->sectors) + 1;
+	struct foolcache_c *fcc = m->private;
+	unsigned long blocks = sector2block(fcc, fcc->sectors) + 1;
+	
+	seq_puts(m, "Foolcache\n");
+	seq_printf(m, "Origin: %s\n", fcc->origin->name);
+	seq_printf(m, "Cache: %s\n", fcc->cache->name);
 	print_percent(m, "Hit", fcc->hits, fcc->hits + fcc->misses);
 	print_percent(m, "Fullfillment", fcc->cached_blocks, blocks);
 	return 0;
