@@ -14,6 +14,7 @@
 #include <linux/dm-io.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/fiemap.h>
 
 #define DM_MSG_PREFIX "foolcache"
 
@@ -36,6 +37,7 @@ struct foolcache_c {
 	struct dm_io_client* io_client;
 	unsigned int bypassing;
 	sector_t sectors, last_caching_sector;
+	unsigned long size, blocks;
 	unsigned int block_size;		// block (chunk) size, in sector
 	unsigned int block_shift;
 	unsigned int block_mask;
@@ -76,7 +78,7 @@ inline unsigned char cout_bits_uchar(unsigned char x)
 		 + ((x>>4)&1) + ((x>>5)&1) + ((x>>6)&1) + ((x>>7));
 }
 
-static unsigned long count_bits(unsigned long* buf, unsigned long size)
+static unsigned long count_bits(void* buf, unsigned long size)
 {
 	unsigned long i, r;
 	unsigned char table[256];
@@ -95,6 +97,24 @@ static unsigned long count_bits(unsigned long* buf, unsigned long size)
 	}
 	return r;
 }
+
+// static unsigned long count_bits_offset(void* buf, 
+// 	unsigned long offset, unsigned long size)
+// {
+// 	unsigned long r;
+// 	unsigned char i=offset%8;
+// 	buf = (char*)buf + offset/8;
+// 	if (i==0) return count_bits(buf, size);
+
+// 	r = 0;
+// 	size -= (8-i);
+// 	for (; i<8; ++i)
+// 	{
+// 		r += test_bit(i, buf);
+// 	}
+// 	buf = (char*)buf +1;
+// 	return r + count_bits(buf, size);
+// }
 
 static int write_bitmap(struct foolcache_c* fcc)
 {
@@ -289,6 +309,11 @@ static inline bool isorder2(unsigned int x)
 	return (x & (x-1)) == 0;
 }
 
+static inline unsigned long DIV(unsigned long a, unsigned long b)
+{
+	return a/b + (a%b > 0);
+}
+
 /*
  * Construct a foolcache mapping
  *      origin cache block_size [create]
@@ -319,8 +344,9 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad2;
 	}
 
-	fcc->sectors = (i_size_read(fcc->origin->bdev->bd_inode) >> SECTOR_SHIFT);
-	if (fcc->sectors != (i_size_read(fcc->cache->bdev->bd_inode) >> SECTOR_SHIFT))
+	fcc->size = i_size_read(fcc->origin->bdev->bd_inode);
+	fcc->sectors = (fcc->size >> SECTOR_SHIFT);
+	if (fcc->size != i_size_read(fcc->cache->bdev->bd_inode))
 	{
 		ti->error = "dm-foolcache: Device sub-device size mismatch";
 		goto bad3;
@@ -333,11 +359,12 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	printk("dm-foolcache: bs %uKB\n", bs);
 
 	bs*=(1024/512); // KB to sector
+	fcc->blocks = DIV(fcc->sectors, bs);
 	fcc->block_size = bs;
 	fcc->block_shift = ffs(bs)-1;
 	fcc->block_mask = ~(bs-1);
 	printk("dm-foolcache: bshift %u, bmask %u\n", fcc->block_shift, fcc->block_mask);
-	fcc->bitmap_sectors = fcc->sectors/bs/8/512 + 1; 	// sizeof bitmap, in sector
+	fcc->bitmap_sectors = DIV(fcc->blocks, 8*512); 	// sizeof bitmap, in sector
 	fcc->last_caching_sector = fcc->sectors - 1 - 1 - fcc->bitmap_sectors;
 	bitmap_size = fcc->bitmap_sectors*512;
 	fcc->bitmap = vzalloc(bitmap_size);
@@ -449,16 +476,128 @@ static void foolcache_status(struct dm_target *ti, status_type_t type,
 	}
 }
 
+static inline int foolcache_fibmap(struct foolcache_c *fcc, int __user *p)
+{
+	int res, block;
+	res = get_user(block, p);
+	if (res)
+		return res;
+	// block = mapping->a_ops->bmap(mapping, block);
+	block = 0xcc;
+	return put_user(block, p);
+}
+
+static inline int foolcache_figetbsz(struct foolcache_c *fcc, int __user *p)
+{
+	return put_user(fcc->block_size*512, p);
+}
+
+static int fiemap_check_ranges(struct foolcache_c *fcc,
+			       u64 start, u64 len, u64 *new_len)
+{
+	u64 maxbytes = (u64) fcc->size;
+
+	*new_len = len;
+
+	if (len == 0)
+		return -EINVAL;
+
+	if (start > maxbytes)
+		return -EFBIG;
+
+	/*
+	 * Shrink request scope to what the fs can actually handle.
+	 */
+	if (len > maxbytes || (maxbytes - len) < start)
+		*new_len = maxbytes - start;
+
+	return 0;
+}
+
+// static int ext4_fill_fiemap_extents(struct inode *inode,
+// 				    ext4_lblk_t block, ext4_lblk_t num,
+// 				    struct fiemap_extent_info *fieinfo)
+// {
+
+// }
+
+int fiemap_fill_next_extent(struct fiemap_extent_info *fieinfo, u64 logical,
+			    u64 phys, u64 len, u32 flags);
+
+
+int foolcache_do_fiemap(struct foolcache_c *fcc, struct fiemap_extent_info *fieinfo,
+	__u64 start, __u64 len)
+{
+	unsigned long i, c, shift;
+	shift = fcc->block_shift + 9;
+	for (i=c=0; i<fcc->blocks; ++i) 
+		if (test_bit(i, fcc->bitmap))
+		{
+			c++;
+			fiemap_fill_next_extent(fieinfo, i<<shift, i<<shift, 1<<shift, 
+				(c==fcc->cached_blocks) ? FIEMAP_EXTENT_LAST : 0);
+		}
+	return 0;
+}
+
+#define FIEMAP_MAX_EXTENTS	(UINT_MAX / sizeof(struct fiemap_extent))
+static int foolcache_fiemap(struct foolcache_c *fcc, int __user *p)
+{
+	struct fiemap fiemap;
+	struct fiemap __user *ufiemap = (struct fiemap __user *) p;
+	struct fiemap_extent_info fieinfo = { 0, };
+	u64 len;
+	int error;
+
+	if (copy_from_user(&fiemap, ufiemap, sizeof(fiemap)))
+		return -EFAULT;
+
+	if (fiemap.fm_extent_count > FIEMAP_MAX_EXTENTS)
+		return -EINVAL;
+
+	error = fiemap_check_ranges(fcc, fiemap.fm_start, fiemap.fm_length,
+				    &len);
+	if (error)
+		return error;
+
+	fieinfo.fi_flags = fiemap.fm_flags;
+	fieinfo.fi_extents_max = fiemap.fm_extent_count;
+	fieinfo.fi_extents_start = ufiemap->fm_extents;
+
+	if (fiemap.fm_extent_count != 0 &&
+	    !access_ok(VERIFY_WRITE, fieinfo.fi_extents_start,
+		       fieinfo.fi_extents_max * sizeof(struct fiemap_extent)))
+		return -EFAULT;
+
+	error = foolcache_do_fiemap(fcc, &fieinfo, fiemap.fm_start, len);
+	fiemap.fm_flags = fieinfo.fi_flags;
+	fiemap.fm_mapped_extents = fieinfo.fi_extents_mapped;
+
+	if (copy_to_user(ufiemap, &fiemap, sizeof(fiemap)))
+		error = -EFAULT;
+
+	return error;
+}
+
 static int foolcache_ioctl(struct dm_target *ti, unsigned int cmd,
 			unsigned long arg)
 {
-//	struct foolcache_c *fcc = ti->private;
+	struct foolcache_c *fcc = ti->private;
+	int __user *p = (int __user *)arg;
 	int r = 0;
 
-	// if (cmd==FIEMAP)
-	// {
+	switch (cmd)
+	{
+	case FIBMAP:
+		return foolcache_fibmap(fcc, p);
 
-	// }
+	case FIGETBSZ:
+		return foolcache_figetbsz(fcc, p);
+
+	case FS_IOC_FIEMAP:
+		return foolcache_fiemap(fcc, p);
+
+	}
 
 	return r;
 }
@@ -526,6 +665,7 @@ static int foolcache_proc_show(struct seq_file* m, void* v)
 	seq_puts(m, "Foolcache\n");
 	seq_printf(m, "Origin: %s\n", fcc->origin->name);
 	seq_printf(m, "Cache: %s\n", fcc->cache->name);
+	seq_printf(m, "BlockSize: %uKB\n", fcc->block_size*512/1024);
 	print_percent(m, "Hit", fcc->hits, fcc->hits + fcc->misses);
 	print_percent(m, "Fullfillment", fcc->cached_blocks, blocks);
 	return 0;
