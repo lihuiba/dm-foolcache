@@ -1,0 +1,8 @@
+#ifndef __FOOLCACHE_IOCTL_
+#define __FOOLCACHE_IOCTL_
+
+#define FOOLCACHE_GETBSZ 0xfc01
+#define FOOLCACHE_FIBMAP 0xfc02
+#define FOOLCACHE_FIEMAP 0xfc03
+
+#endif

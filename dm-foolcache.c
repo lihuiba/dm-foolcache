@@ -15,6 +15,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/fiemap.h>
+#include "ioctl.h"
 
 #define DM_MSG_PREFIX "foolcache"
 
@@ -365,7 +366,7 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	fcc->block_mask = ~(bs-1);
 	printk("dm-foolcache: bshift %u, bmask %u\n", fcc->block_shift, fcc->block_mask);
 	fcc->bitmap_sectors = DIV(fcc->blocks, 8*512); 	// sizeof bitmap, in sector
-	fcc->last_caching_sector = fcc->sectors - 1 - 1 - fcc->bitmap_sectors;
+	fcc->last_caching_sector = fcc->sectors - 1 - max(1-fcc->bitmap_sectors, bs);
 	bitmap_size = fcc->bitmap_sectors*512;
 	fcc->bitmap = vzalloc(bitmap_size);
 	fcc->copying = vzalloc(bitmap_size);
@@ -480,10 +481,9 @@ static inline int foolcache_fibmap(struct foolcache_c *fcc, int __user *p)
 {
 	int res, block;
 	res = get_user(block, p);
-	if (res)
-		return res;
-	// block = mapping->a_ops->bmap(mapping, block);
-	block = 0xcc;
+	if (res) return res;
+	if (block >= fcc->blocks) return -1;
+	block = test_bit(block, fcc->bitmap)!=0;
 	return put_user(block, p);
 }
 
@@ -584,22 +584,22 @@ static int foolcache_ioctl(struct dm_target *ti, unsigned int cmd,
 {
 	struct foolcache_c *fcc = ti->private;
 	int __user *p = (int __user *)arg;
-	int r = 0;
+	printk("dm-foolcache: ioctl cmd=0x%x\n", cmd);
 
 	switch (cmd)
 	{
-	case FIBMAP:
-		return foolcache_fibmap(fcc, p);
-
-	case FIGETBSZ:
+	case FOOLCACHE_GETBSZ:
 		return foolcache_figetbsz(fcc, p);
 
-	case FS_IOC_FIEMAP:
+	case FOOLCACHE_FIBMAP:
+		return foolcache_fibmap(fcc, p);
+
+	case FOOLCACHE_FIEMAP:
 		return foolcache_fiemap(fcc, p);
 
+	default:
+		return -1;
 	}
-
-	return r;
 }
 /*
 static int foolcache_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
