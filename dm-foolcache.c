@@ -283,6 +283,38 @@ wait:
 	goto wait;
 }
 
+static int map_sync(struct foolcache_c* fcc, struct bio* bio)
+{
+	sector_t last_sector;
+	u64 now = get_jiffies_64();
+	if (fcc->bitmap_last_sync+HZ*16 < now || now < fcc->bitmap_last_sync)
+	{
+		write_bitmap(fcc, write_bitmap_callback);
+	}
+
+	if (bio_data_dir(bio) == WRITE)
+	{
+		return -EIO;
+	}
+
+	last_sector = bio->bi_sector + bio->bi_size/512 - 1;
+	if (unlikely(fcc->bypassing || last_sector > fcc->last_caching_sector))
+	{
+		bio->bi_bdev = fcc->origin->bdev;
+	}
+	else
+	{	// preparing the cache, followed by remapping
+		unsigned long end_block = sector2block(fcc, last_sector);
+		unsigned long i = sector2block(fcc, bio->bi_sector);
+		for (; i<=end_block; ++i)
+		{
+			ensure_block(fcc, i);
+		}
+		bio->bi_bdev = fcc->bypassing ? fcc->origin->bdev : fcc->cache->bdev;
+	}
+	return DM_MAPIO_REMAPPED;
+}
+
 static void do_read_async_callback(unsigned long error, void* context)
 {
 	struct job_kcopyd* job = context;
@@ -313,10 +345,24 @@ static void do_read_async(struct job_kcopyd* job, struct dm_dev* target)
 	dm_io(&io_req, 1, &region, NULL);
 }
 
+static inline unsigned long find_next_copying_block(
+	struct foolcache_c* fcc, unsigned long start, unsigned long end)
+{
+	for (;start<=end; ++start)
+	{
+		if (!test_bit(start, fcc->bitmap))
+		{
+			return start;
+		}
+	}
+	return -1;
+}
+
 static int ensure_block_async(struct job_kcopyd* job);
 static void ensure_block_async_callback(int read_err, 
 	unsigned long write_err, void *context)
 {
+	unsigned long block;
 	struct job_kcopyd* job = context;
 	struct foolcache_c* fcc = job->fcc;
 
@@ -325,18 +371,19 @@ static void ensure_block_async_callback(int read_err,
 	if (fcc->bypassing)
 	{
 		do_read_async(job, fcc->origin);
+		return;
 	}
-	else if (job->copying_block >= job->end_block)
+
+	block = find_next_copying_block(fcc, 
+		job->copying_block, job->end_block);
+	if (block >= job->end_block)
 	{
 		do_read_async(job, fcc->cache);
-	}
-	else
-	{
-		job->copying_block++;
-		ensure_block_async(job);
-	}
+		return;
+	}	
+	job->copying_block = block;
+	ensure_block_async(job);
 }
-
 
 static int ensure_block_async(struct job_kcopyd* job)
 {
@@ -394,39 +441,6 @@ wait:
 	return 0;
 }
 
-
-static int map_sync(struct foolcache_c* fcc, struct bio* bio)
-{
-	sector_t last_sector;
-	u64 now = get_jiffies_64();
-	if (fcc->bitmap_last_sync+HZ*16 < now || now < fcc->bitmap_last_sync)
-	{
-		write_bitmap(fcc, write_bitmap_callback);
-	}
-
-	if (bio_data_dir(bio) == WRITE)
-	{
-		return -EIO;
-	}
-
-	last_sector = bio->bi_sector + bio->bi_size/512 - 1;
-	if (unlikely(fcc->bypassing || last_sector > fcc->last_caching_sector))
-	{
-		bio->bi_bdev = fcc->origin->bdev;
-	}
-	else
-	{	// preparing the cache, followed by remapping
-		struct job_kcopyd* job = kmalloc(sizeof(*job), __KERNEL__);
-		job->end_block = sector2block(fcc, last_sector);
-		job->copying_block = sector2block(fcc, bio->bi_sector);
-		job->bio = bio;
-		job->fcc = fcc;
-		ensure_block_async(job);
-		//bio->bi_bdev = fcc->bypassing ? fcc->origin->bdev : fcc->cache->bdev;
-	}
-	return DM_MAPIO_REMAPPED;
-}
-
 static int map_async(struct foolcache_c* fcc, struct bio* bio)
 {
 	sector_t last_sector;
@@ -449,13 +463,23 @@ static int map_async(struct foolcache_c* fcc, struct bio* bio)
 	}
 	else
 	{	// preparing the cache, followed by remapping
+		struct job_kcopyd* job;
 		unsigned long end_block = sector2block(fcc, last_sector);
-		unsigned long i = sector2block(fcc, bio->bi_sector);
-		for (; i<=end_block; ++i)
-		{
-			ensure_block(fcc, i);
+		unsigned long start_block = find_next_copying_block(
+			fcc, sector2block(fcc, bio->bi_sector), end_block);
+		
+		if (start_block == -1)
+		{	//all blocks are hit
+			bio->bi_bdev = fcc->cache->bdev;
+			return DM_MAPIO_REMAPPED;
 		}
-		bio->bi_bdev = fcc->bypassing ? fcc->origin->bdev : fcc->cache->bdev;
+
+		job = kmalloc(sizeof(*job), __KERNEL__);
+		job->copying_block = start_block;
+		job->end_block = end_block;
+		job->bio = bio;
+		job->fcc = fcc;
+		ensure_block_async(job);
 		return DM_MAPIO_SUBMITTED;
 	}
 }
