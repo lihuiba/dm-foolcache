@@ -117,13 +117,18 @@ static unsigned long count_bits(void* buf, unsigned long size)
 // 	return r + count_bits(buf, size);
 // }
 
-static int write_bitmap(struct foolcache_c* fcc)
+static void write_bitmap_callback(unsigned long error, void *context)
+{
+
+}
+
+static int write_bitmap(struct foolcache_c* fcc, io_notify_fn callback)
 {
 	int r;
 	struct dm_io_region region;
 	struct dm_io_request io_req;
 	
-	if (fcc->bitmap_modified == 0)
+	if (!fcc->bitmap_modified)
 	{
 		return 0;
 	}
@@ -134,11 +139,11 @@ static int write_bitmap(struct foolcache_c* fcc)
 	io_req.bi_rw = WRITE;
 	io_req.mem.type = DM_IO_VMA;
 	io_req.mem.ptr.vma = fcc->bitmap;
-	io_req.notify.fn = NULL;
-	// io_req.notify.context = NULL;
+	io_req.notify.fn = callback;
+	io_req.notify.context = fcc;
 	io_req.client = fcc->io_client;
 
-	r=dm_io(&io_req, 1, &region, NULL);
+	r = dm_io(&io_req, 1, &region, NULL);
 	if (r!=0) return r;
 	fcc->bitmap_modified = 0;
 	return 0;
@@ -169,7 +174,7 @@ static int write_header(struct foolcache_c* fcc)
 
 static inline int write_ender(struct foolcache_c* fcc)
 {
-	return write_bitmap(fcc) || write_header(fcc);
+	return write_bitmap(fcc, NULL) || write_header(fcc);
 }
 
 static int read_ender(struct foolcache_c* fcc)
@@ -279,7 +284,7 @@ static int foolcache_map_sync(struct foolcache_c* fcc, struct bio* bio)
 	u64 now = get_jiffies_64();
 	if (fcc->bitmap_last_sync+HZ*10 < now || now < fcc->bitmap_last_sync)
 	{
-		write_bitmap(fcc);
+		write_bitmap(fcc, write_bitmap_callback);
 	}
 
 	if (bio_data_dir(bio) == WRITE)
@@ -448,7 +453,7 @@ bad1:
 static void foolcache_dtr(struct dm_target *ti)
 {
 	struct foolcache_c *fcc = ti->private;
-	write_bitmap(fcc);
+	write_bitmap(fcc, NULL);
 	vfree(fcc->bitmap);
 	vfree(fcc->copying);
 	vfree(fcc->header);
