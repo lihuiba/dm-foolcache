@@ -458,6 +458,7 @@ static int map_async(struct foolcache_c* fcc, struct bio* bio)
 	last_sector = bio->bi_sector + bio->bi_size/512 - 1;
 	if (unlikely(fcc->bypassing || last_sector > fcc->last_caching_sector))
 	{
+		fcc->misses++;
 		bio->bi_bdev = fcc->origin->bdev;
 		return DM_MAPIO_REMAPPED;
 	}
@@ -470,6 +471,7 @@ static int map_async(struct foolcache_c* fcc, struct bio* bio)
 		
 		if (start_block == -1)
 		{	//all blocks are hit
+			fcc->hits++;
 			bio->bi_bdev = fcc->cache->bdev;
 			return DM_MAPIO_REMAPPED;
 		}
@@ -777,7 +779,7 @@ static int foolcache_ioctl(struct dm_target *ti, unsigned int cmd,
 		return foolcache_fiemap(fcc, p);
 
 	default:
-		return -1;
+		return -ENOTTY;
 	}
 }
 /*
