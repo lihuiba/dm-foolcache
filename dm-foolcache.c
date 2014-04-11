@@ -19,6 +19,9 @@
 
 #define DM_MSG_PREFIX "foolcache"
 
+static int async;
+module_param(async, int, 0);
+
  /* TODOs:
 merge the bitmaps
 
@@ -392,7 +395,7 @@ wait:
 }
 
 
-static int foolcache_map_sync(struct foolcache_c* fcc, struct bio* bio)
+static int map_sync(struct foolcache_c* fcc, struct bio* bio)
 {
 	sector_t last_sector;
 	u64 now = get_jiffies_64();
@@ -424,7 +427,7 @@ static int foolcache_map_sync(struct foolcache_c* fcc, struct bio* bio)
 	return DM_MAPIO_REMAPPED;
 }
 
-static int foolcache_map_async(struct foolcache_c* fcc, struct bio* bio)
+static int map_async(struct foolcache_c* fcc, struct bio* bio)
 {
 	sector_t last_sector;
 	u64 now = get_jiffies_64();
@@ -785,7 +788,14 @@ static int foolcache_map(struct dm_target *ti, struct bio *bio,
 		      union map_info *map_context)
 {
 	struct foolcache_c *fcc = ti->private;
-	return foolcache_map_sync(fcc, bio);
+	return map_sync(fcc, bio);
+}
+
+static int foolcache_map_async(struct dm_target *ti, struct bio *bio,
+		      union map_info *map_context)
+{
+	struct foolcache_c *fcc = ti->private;
+	return map_async(fcc, bio);
 }
 
 static struct target_type foolcache_target = {
@@ -852,7 +862,9 @@ static inline void proc_remove_entry(struct foolcache_c* fcc)
 
 int __init dm_foolcache_init(void)
 {
-	int r = dm_register_target(&foolcache_target);
+	int r;
+	if (async) foolcache_target.map = foolcache_map_async;
+	r = dm_register_target(&foolcache_target);
 	if (r < 0)
 	{
 		DMERR("register failed %d", r);
@@ -868,7 +880,6 @@ void dm_foolcache_exit(void)
 	dm_unregister_target(&foolcache_target);
 	remove_proc_entry("foolcache", NULL);
 }
-
 
 /* Module hooks */
 module_init(dm_foolcache_init);
