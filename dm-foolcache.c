@@ -426,7 +426,7 @@ wait:
 	{
 		fcc->hits++;
 		clear_bit(block, fcc->copying);
-		do_read_async(job, fcc->cache);
+		ensure_block_async_callback(0, 0, job);
 		return 0;
 	}
 
@@ -437,7 +437,7 @@ wait:
 	job->origin.sector = job->cache.sector = block2sector(fcc, block);
 	job->origin.count = job->cache.count = fcc->block_size;	
 	dm_kcopyd_copy(fcc->kcopyd_client, &job->origin, 1, &job->cache, 
-		0, ensure_block_async_callback, &job);
+		0, ensure_block_async_callback, job);
 	return 0;
 }
 
