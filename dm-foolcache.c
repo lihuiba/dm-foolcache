@@ -15,6 +15,10 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/fiemap.h>
+#include <linux/types.h>
+#include <linux/atomic.h>
+
+//#include <arch/x86/include/asm/atomic.h>
 #include "ioctl.h"
 
 #define DM_MSG_PREFIX "foolcache"
@@ -53,7 +57,7 @@ struct foolcache_c {
 	unsigned int bitmap_sectors;
 	struct completion copied;
 	struct dm_kcopyd_client* kcopyd_client;
-	unsigned long cached_blocks, hits, misses;
+	atomic64_t cached_blocks, hits, misses;
 };
 
 struct job_kcopyd {
@@ -225,7 +229,7 @@ static void ensure_block_callback(int read_err,
 	else
 	{
 		set_bit(block, fcc->bitmap);
-		fcc->cached_blocks++;
+		atomic64_inc(&fcc->cached_blocks);
 		fcc->bitmap_modified = 1;
 	}
 
@@ -240,14 +244,14 @@ static int ensure_block(struct foolcache_c* fcc, unsigned int block)
 	if (fcc->bypassing) return 0;
 	if (test_bit(block, fcc->bitmap))
 	{
-		fcc->hits++;
+		atomic64_inc(&fcc->hits);
 		return 0;
 	}
 
 	// before copying
 	if (test_and_set_bit(block, fcc->copying))
 	{	// the block is being copied by another thread, let's just wait
-		fcc->hits++;
+		atomic64_inc(&fcc->hits);
 wait:
 		//printk("dm-foolcache: pre-wait\n");
 		wait_for_completion_timeout(&fcc->copied, 1*HZ);
@@ -265,13 +269,13 @@ wait:
 
 	if (test_bit(block, fcc->bitmap))
 	{
-		fcc->hits++;
+		atomic64_inc(&fcc->hits);
 		clear_bit(block, fcc->copying);
 		return 0;
 	}
 
 	// do copying
-	fcc->misses++;
+	atomic64_inc(&fcc->misses);
 	job.fcc = fcc;
 	job.copying_block = block;
 	job.origin.bdev = fcc->origin->bdev;
@@ -300,6 +304,7 @@ static int map_sync(struct foolcache_c* fcc, struct bio* bio)
 	last_sector = bio->bi_sector + bio->bi_size/512 - 1;
 	if (unlikely(fcc->bypassing || last_sector > fcc->last_caching_sector))
 	{
+		atomic64_inc(&fcc->misses);
 		bio->bi_bdev = fcc->origin->bdev;
 	}
 	else
@@ -350,8 +355,13 @@ static inline unsigned long find_next_copying_block(
 {
 	for (;start<=end; ++start)
 	{
-		if (!test_bit(start, fcc->bitmap))
+		if (likely(test_bit(start, fcc->bitmap)))
 		{
+			atomic64_inc(&fcc->hits);
+		}
+		else
+		{
+			atomic64_inc(&fcc->misses);
 			return start;
 		}
 	}
@@ -374,8 +384,7 @@ static void ensure_block_async_callback(int read_err,
 		return;
 	}
 
-	block = find_next_copying_block(fcc, 
-		job->copying_block, job->end_block);
+	block = find_next_copying_block(fcc, job->copying_block, job->end_block);
 	if (block >= job->end_block)
 	{
 		do_read_async(job, fcc->cache);
@@ -394,17 +403,12 @@ static int ensure_block_async(struct job_kcopyd* job)
 		do_read_async(job, fcc->origin);
 		return 0;
 	}
-	if (test_bit(block, fcc->bitmap))
-	{
-		fcc->hits++;
-		ensure_block_async_callback(0, 0, job);
-		return 0;
-	}
 
 	// before copying
 	if (test_and_set_bit(block, fcc->copying))
 	{	// the block is being copied by another thread, let's just wait
-		fcc->hits++;
+		atomic64_inc(&fcc->hits);		// it's really a hit, 
+		atomic64_dec(&fcc->misses);		// instead of a miss
 wait:
 		//printk("dm-foolcache: pre-wait\n");
 		wait_for_completion_timeout(&fcc->copied, 1*HZ);
@@ -424,14 +428,14 @@ wait:
 
 	if (test_bit(block, fcc->bitmap))
 	{
-		fcc->hits++;
+		atomic64_inc(&fcc->hits);		// it's really a hit, 
+		atomic64_dec(&fcc->misses);		// instead of a miss
 		clear_bit(block, fcc->copying);
 		ensure_block_async_callback(0, 0, job);
 		return 0;
 	}
 
 	// do copying
-	fcc->misses++;
 	job->origin.bdev = fcc->origin->bdev;
 	job->cache.bdev = fcc->cache->bdev;
 	job->origin.sector = job->cache.sector = block2sector(fcc, block);
@@ -458,7 +462,8 @@ static int map_async(struct foolcache_c* fcc, struct bio* bio)
 	last_sector = bio->bi_sector + bio->bi_size/512 - 1;
 	if (unlikely(fcc->bypassing || last_sector > fcc->last_caching_sector))
 	{
-		fcc->misses++;
+		unsigned long blocks = sector2block(fcc, last_sector) - sector2block(fcc, bio->bi_sector) + 1;
+		atomic64_add(blocks, &fcc->misses);
 		bio->bi_bdev = fcc->origin->bdev;
 		return DM_MAPIO_REMAPPED;
 	}
@@ -466,12 +471,12 @@ static int map_async(struct foolcache_c* fcc, struct bio* bio)
 	{	// preparing the cache, followed by remapping
 		struct job_kcopyd* job;
 		unsigned long end_block = sector2block(fcc, last_sector);
-		unsigned long start_block = find_next_copying_block(
-			fcc, sector2block(fcc, bio->bi_sector), end_block);
-		
+		unsigned long start_block = sector2block(fcc, bio->bi_sector);
+		start_block = find_next_copying_block(fcc, start_block, end_block);
+		//printk("dm-foolcache: reading block %lu to %lu\n", start_block, end_block);
+
 		if (start_block == -1)
 		{	//all blocks are hit
-			fcc->hits++;
 			bio->bi_bdev = fcc->cache->bdev;
 			return DM_MAPIO_REMAPPED;
 		}
@@ -572,14 +577,14 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad5;
 	}
 
-	fcc->hits = 0;
-	fcc->misses = 0;
+	atomic64_set(&fcc->hits, 0);
+	atomic64_set(&fcc->misses, 0);
 	memset(fcc->copying, 0, bitmap_size);
 	if (argc>=4 && strcmp(argv[3], "create")==0)
 	{	// create new cache
+		atomic64_set(&fcc->cached_blocks, 0);
 		memset(fcc->bitmap, 0, bitmap_size);
 		fcc->bitmap_modified = 1;
-		fcc->cached_blocks = 0;
 		r = write_ender(fcc);
 		if (r!=0)
 		{
@@ -590,7 +595,8 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	else
 	{	// open existing cache
 		r = read_ender(fcc);
-		fcc->cached_blocks = count_bits(fcc->bitmap, fcc->sectors);
+		atomic64_set(&fcc->cached_blocks, 
+			count_bits(fcc->bitmap, fcc->sectors));
 		if (r!=0)
 		{
 			ti->error = "dm-foolcache: ender read error";
@@ -712,12 +718,14 @@ int foolcache_do_fiemap(struct foolcache_c *fcc, struct fiemap_extent_info *fiei
 	unsigned long i, c, shift;
 	shift = fcc->block_shift + 9;
 	for (i=c=0; i<fcc->blocks; ++i) 
+	{
 		if (test_bit(i, fcc->bitmap))
 		{
 			c++;
 			fiemap_fill_next_extent(fieinfo, i<<shift, i<<shift, 1<<shift, 
-				(c==fcc->cached_blocks) ? FIEMAP_EXTENT_LAST : 0);
+				(c==atomic64_read(&fcc->cached_blocks)) ? FIEMAP_EXTENT_LAST : 0);
 		}
+	}
 	return 0;
 }
 
@@ -765,7 +773,7 @@ static int foolcache_ioctl(struct dm_target *ti, unsigned int cmd,
 {
 	struct foolcache_c *fcc = ti->private;
 	int __user *p = (int __user *)arg;
-	printk("dm-foolcache: ioctl cmd=0x%x\n", cmd);
+	//printk("dm-foolcache: ioctl cmd=0x%x\n", cmd);
 
 	switch (cmd)
 	{
@@ -847,15 +855,15 @@ static inline void print_percent(struct seq_file *m, const char* title,
 
 static int foolcache_proc_show(struct seq_file* m, void* v)
 {
+	unsigned long hits;
 	struct foolcache_c *fcc = m->private;
-	unsigned long blocks = sector2block(fcc, fcc->sectors) + 1;
-	
 	seq_puts(m, "Foolcache\n");
 	seq_printf(m, "Origin: %s\n", fcc->origin->name);
 	seq_printf(m, "Cache: %s\n", fcc->cache->name);
 	seq_printf(m, "BlockSize: %uKB\n", fcc->block_size*512/1024);
-	print_percent(m, "Hit", fcc->hits, fcc->hits + fcc->misses);
-	print_percent(m, "Fullfillment", fcc->cached_blocks, blocks);
+	hits = atomic64_read(&fcc->hits);
+	print_percent(m, "Hit", hits, hits + atomic64_read(&fcc->misses));
+	print_percent(m, "Fullfillment", atomic64_read(&fcc->cached_blocks), fcc->blocks);
 	return 0;
 }
 
@@ -889,7 +897,10 @@ static inline void proc_remove_entry(struct foolcache_c* fcc)
 int __init dm_foolcache_init(void)
 {
 	int r;
-	if (async) foolcache_target.map = foolcache_map_async;
+	if (async) 
+	{
+		foolcache_target.map = foolcache_map_async;
+	}
 	r = dm_register_target(&foolcache_target);
 	if (r < 0)
 	{
