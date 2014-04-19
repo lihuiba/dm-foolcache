@@ -17,11 +17,15 @@
 #include <linux/fiemap.h>
 #include <linux/types.h>
 #include <linux/atomic.h>
+#include <linux/delay.h>
 
 //#include <arch/x86/include/asm/atomic.h>
 #include "ioctl.h"
 
 #define DM_MSG_PREFIX "foolcache"
+
+// DECLARE_DM_KCOPYD_THROTTLE_WITH_MODULE_PARM(fc_cor,
+// 		"A percentage of time allocated for Copy-On-Read");
 
 const static char SIGNATURE[]="FOOLCACHE";
 struct header {
@@ -346,7 +350,12 @@ wait:
 		return 0;
 	}
 
+	while(atomic_read(&fcc->kcopyd_jobs)>100)
+	{
+		msleep(100);
+	}
 	// do copying
+	atomic_inc(&fcc->kcopyd_jobs);
 	job->origin.bdev = fcc->origin->bdev;
 	job->cache.bdev = fcc->cache->bdev;
 	job->origin.sector = job->cache.sector = block2sector(fcc, block);
@@ -354,7 +363,6 @@ wait:
 	dm_kcopyd_copy(fcc->kcopyd_client, &job->origin, 1, &job->cache, 
 		0, ensure_block_async_callback_dec, job);
 	atomic64_inc(&fcc->cached_blocks);
-	atomic_inc(&fcc->kcopyd_jobs);
 	return 0;
 }
 
@@ -484,6 +492,7 @@ static int foolcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	fcc->kcopyd_client = dm_kcopyd_client_create();
+	// fcc->kcopyd_client = dm_kcopyd_client_create(&dm_kcopyd_throttle);
 	if (IS_ERR(fcc->kcopyd_client))
 	{
 		ti->error = "dm-foolcache: dm_kcopyd_client_create() error";
