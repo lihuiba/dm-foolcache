@@ -3,8 +3,72 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <linux/fiemap.h>
 #include "ioctl.h"
+
+const char* error = NULL;
+
+struct foolcache {
+	int fd;
+	size_t size, blocks;
+	unsigned int blocksize;
+};
+
+void replicate(int fd)
+{
+
+}
+
+foolcache* foolcache_ctor(const char* path)
+{
+	int ret;
+	foolcache* fc;
+	struct stat stat;
+	fc = malloc(sizeof(*fc));
+	if (fc==NULL) return NULL;
+
+	fcc->fd = open(path, "rb");
+	if (fcc->fd==-1)
+	{
+		error = "open failed";
+		goto out1;
+	}
+
+	ret = fstat(fd, &stat);
+	if (ret) 
+	{
+		error = "fstat failed"
+		goto out2;
+	}
+	fc->size = stat.st_size;
+
+	ret = ioctl(fd, FOOLCACHE_GETBSZ, &fc->blocksize);
+	if (ret==-1)
+	{
+		error = strerror(errno);
+		goto out2;
+	}
+	fc->blocks = fc->size / fc->blocksize;
+	
+	return fc;
+
+
+out2:
+	close(fc->fd);
+out1:
+	free(fc);
+	return NULL;
+}
+
+int foolcache_fibmap(struct foolcache* fc, int block)
+{
+	int ret = ioctl(fd, FOOLCACHE_FIBMAP, &block);
+	if (ret==-1) return -1;
+	return block;
+}
 
 int main(int argc, char** argv)
 {
@@ -12,22 +76,15 @@ int main(int argc, char** argv)
 	int fd, ret, blocksize=0, i, block;
 	struct fiemap fiemap;
 	struct fiemap* fmap;
-	fd = open(argv[1], "rb");
-	if (fd==-1)
+	struct foolcache* fc;
+	fc = foolcache_ctor(argv[1]);
+	if (fc==NULL)
 	{
-		printf("open failed\n");
+		puts(error);
 		return -1;
 	}
 
-	ret = ioctl(fd, FOOLCACHE_GETBSZ, &blocksize);
-	if (ret==-1)
-	{
-		error = strerror(errno);
-		printf("errno=%d (%s)\n", errno, error);
-		close(fd);
-		return -1;	
-	}
-	printf("Block Size: %dKB\n", blocksize/1024);
+	printf("Block Size: %dKB\n", fc->blocksize/1024);
 
 	for (i=0; 1; ++i)
 	{
@@ -65,3 +122,4 @@ int main(int argc, char** argv)
 	close(fd);
 	return 0;
 }
+

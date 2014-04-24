@@ -62,7 +62,7 @@ do
 	for fiobs in 512 1k 2k 4k 8k 16k 32k 64k 128k 256k 512k 1024k 2048k 4096k
 	# for fiobs in 1024k 2048k 4096k
 	do
-		echo "********************** volume size=$size GB,  fcbs = $fcbs KB,  fiobs = $fiobs *********************************"
+		echo "********************** volume size = $size GB,  fcbs = $fcbs KB,  fiobs = $fiobs *********************************"
 		config 8 $fcbs
 		fio --filename=/dev/mapper/fcdev --direct=1 --thread --iodepth 128 --thread --rw=randread --ioengine=libaio --size=100% --numjobs=$threads --bs=$fiobs --group_reporting --name=mytest 
 		cat /proc/foolcache/*
